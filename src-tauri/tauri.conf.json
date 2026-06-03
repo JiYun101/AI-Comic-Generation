@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AI Comic Studio",
+  "version": "0.1.0",
+  "identifier": "com.aicomic.studio",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "AI Comic Studio",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1180,
+        "minHeight": 760
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": []
+  },
+  "plugins": {
+    "sql": {
+      "preload": ["sqlite:ai-comic-studio.db"]
+    }
+  }
+}

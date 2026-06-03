@@ -1,0 +1,118 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 42 26% 94%;
+    --foreground: 240 10% 10%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 10%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 10%;
+    --primary: 174 70% 32%;
+    --primary-foreground: 180 40% 98%;
+    --secondary: 42 24% 90%;
+    --secondary-foreground: 240 10% 10%;
+    --muted: 42 18% 89%;
+    --muted-foreground: 240 4% 44%;
+    --accent: 174 48% 88%;
+    --accent-foreground: 240 10% 10%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 36 14% 82%;
+    --input: 36 14% 82%;
+    --ring: 174 70% 32%;
+  }
+
+  .dark {
+    --background: 228 14% 8%;
+    --foreground: 210 40% 96%;
+    --card: 222 28% 12%;
+    --card-foreground: 210 40% 96%;
+    --popover: 222 28% 12%;
+    --popover-foreground: 210 40% 96%;
+    --primary: 174 63% 48%;
+    --primary-foreground: 180 40% 98%;
+    --secondary: 217 24% 18%;
+    --secondary-foreground: 210 40% 96%;
+    --muted: 217 24% 17%;
+    --muted-foreground: 215 20% 68%;
+    --accent: 201 50% 22%;
+    --accent-foreground: 210 40% 96%;
+    --destructive: 0 63% 45%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 24% 20%;
+    --input: 217 24% 20%;
+    --ring: 174 55% 42%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    min-width: 1180px;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    letter-spacing: 0;
+  }
+
+  button,
+  input,
+  textarea {
+    min-width: 0;
+  }
+
+  button {
+    overflow: hidden;
+  }
+}
+
+@layer components {
+  [data-radix-select-trigger] {
+    min-width: 0;
+  }
+}
+
+.cm-editor {
+  min-height: 160px;
+  border-radius: 8px;
+  border: 1px solid hsl(var(--border));
+  overflow: hidden;
+  font-size: 13px;
+}
+
+.react-flow__node {
+  border-radius: 8px;
+  border: 1px solid hsl(var(--border));
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 999px;
+}
+
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+
+.break-anywhere {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}

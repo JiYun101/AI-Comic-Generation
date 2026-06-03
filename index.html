@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Comic Studio</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        background: #f4f2ed;
+        color: #18181b;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      }
+
+      #boot-shell {
+        display: grid;
+        grid-template-columns: 248px minmax(0, 1fr);
+        width: 100vw;
+        height: 100vh;
+        background: #f4f2ed;
+      }
+
+      .boot-sidebar {
+        border-right: 1px solid #ded8cc;
+        background: #fbfaf6;
+        padding: 20px;
+      }
+
+      .boot-brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        height: 40px;
+      }
+
+      .boot-logo {
+        display: grid;
+        place-items: center;
+        width: 40px;
+        height: 40px;
+        border-radius: 6px;
+        background: #1aa99a;
+        color: white;
+        font-weight: 700;
+      }
+
+      .boot-title {
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      .boot-subtitle {
+        margin-top: 3px;
+        color: #71717a;
+        font-size: 12px;
+      }
+
+      .boot-nav {
+        display: grid;
+        gap: 10px;
+        margin-top: 32px;
+      }
+
+      .boot-line {
+        height: 12px;
+        border-radius: 4px;
+        background: linear-gradient(90deg, #eee8dc 25%, #f8f5ed 37%, #eee8dc 63%);
+        background-size: 400% 100%;
+        animation: boot-shimmer 1.3s ease infinite;
+      }
+
+      .boot-main {
+        display: grid;
+        grid-template-rows: 64px minmax(0, 1fr);
+        min-width: 0;
+      }
+
+      .boot-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border-bottom: 1px solid #ded8cc;
+        background: rgba(255, 255, 255, 0.82);
+        padding: 0 20px;
+      }
+
+      .boot-content {
+        display: grid;
+        grid-template-columns: minmax(430px, 0.9fr) minmax(470px, 1.1fr);
+        gap: 16px;
+        padding: 20px;
+      }
+
+      .boot-panel {
+        border: 1px solid #ded8cc;
+        border-radius: 8px;
+        background: white;
+        padding: 16px;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+      }
+
+      .boot-status {
+        color: #0f766e;
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      @keyframes boot-shimmer {
+        0% {
+          background-position: 100% 0;
+        }
+        100% {
+          background-position: 0 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div id="boot-shell">
+        <aside class="boot-sidebar">
+          <div class="boot-brand">
+            <div class="boot-logo">AI</div>
+            <div>
+              <div class="boot-title">AI Comic Studio</div>
+              <div class="boot-subtitle">桌面漫画生成客户端</div>
+            </div>
+          </div>
+          <div class="boot-nav">
+            <div class="boot-line" style="width: 78%"></div>
+            <div class="boot-line" style="width: 58%"></div>
+            <div class="boot-line" style="width: 64%"></div>
+            <div class="boot-line" style="width: 52%"></div>
+          </div>
+        </aside>
+        <main class="boot-main">
+          <header class="boot-header">
+            <div>
+              <div class="boot-line" style="width: 160px"></div>
+              <div class="boot-line" style="width: 260px; margin-top: 8px"></div>
+            </div>
+            <div class="boot-status">正在启动</div>
+          </header>
+          <section class="boot-content">
+            <div class="boot-panel">
+              <div class="boot-line" style="width: 38%"></div>
+              <div class="boot-line" style="width: 92%; height: 180px; margin-top: 20px"></div>
+              <div class="boot-line" style="width: 70%; margin-top: 16px"></div>
+            </div>
+            <div class="boot-panel">
+              <div class="boot-line" style="width: 30%"></div>
+              <div class="boot-line" style="width: 100%; height: 260px; margin-top: 20px"></div>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
