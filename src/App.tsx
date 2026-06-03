@@ -1,7 +1,6 @@
 ﻿import { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  ArrowDownToLine,
   BookOpen,
   Bot,
   Check,
@@ -21,7 +20,6 @@ import {
   PanelRight,
   Play,
   RefreshCw,
-  Route,
   Save,
   Settings2,
   Sparkles,
@@ -40,9 +38,12 @@ import { Switch } from "./components/ui/switch";
 import { Textarea } from "./components/ui/textarea";
 import { Toast, ToastDescription, ToastProvider, ToastTitle, ToastViewport } from "./components/ui/toast";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
+import { ComicImageFrame } from "./components/ComicImageFrame";
 import { createLongComicImage, createMockCharacterSheet, createMockComicImage, imageUrlToBlob } from "./services/mockAssets";
 import { fetchProviderModels, generateImageWithNewApi } from "./services/newApiClient";
 import { saveLongImageNative } from "./services/nativeExport";
+import { persistImageAsset, persistProjectsImageAssets } from "./services/nativeAssets";
+import { promptTemplateLabel, promptTemplateNodeLabel, promptTemplateVariables, recommendedPromptTemplates, renderPromptTemplate } from "./services/promptVariables";
 import {
   clearApiKeySecret,
   cacheApiKeySecrets,
@@ -78,6 +79,8 @@ import {
   PromptTemplates,
   ProjectRecord,
   ReaderMode,
+  VisualAnchor,
+  VisualAnchorType,
   WorkflowNodeConfig,
   WorkspaceTab
 } from "./types";
@@ -86,8 +89,8 @@ const navItems: Array<{ id: WorkspaceTab; label: string; icon: typeof Wand2 }> =
   { id: "studio", label: "创作台", icon: Wand2 },
   { id: "storyboard", label: "分镜", icon: SquareStack },
   { id: "characters", label: "人设", icon: Palette },
+  { id: "anchors", label: "素材", icon: Layers3 },
   { id: "projects", label: "项目", icon: PanelsTopLeft },
-  { id: "workflow", label: "流程", icon: Route },
   { id: "settings", label: "模型", icon: Settings2 },
   { id: "logs", label: "日志", icon: ListChecks },
   { id: "export", label: "导出", icon: Download }
@@ -105,6 +108,14 @@ const ratioLabel: Record<ExportRatio, string> = {
   "3:4": "3:4 小红书翻页",
   "4:5": "4:5 抖音封面",
   "1:1": "1:1 方图"
+};
+
+const anchorTypeLabel: Record<VisualAnchorType, string> = {
+  product: "产品",
+  prop: "道具",
+  scene: "场景",
+  logo: "品牌/Logo",
+  style: "风格"
 };
 
 const imageSizeOptions = [
@@ -213,16 +224,49 @@ function getPageCharacters(project: ComicProject, page: ComicPage) {
     .filter(Boolean) as CharacterTemplate[];
 }
 
+function getEnabledAnchors(project: ComicProject) {
+  return (project.visualAnchors ?? []).filter((anchor) => anchor.enabled !== false);
+}
+
+function getPageAnchors(project: ComicProject, page: ComicPage) {
+  const anchors = getEnabledAnchors(project);
+  const knownIds = new Set(anchors.map((anchor) => anchor.id));
+  return (page.anchorIds ?? [])
+    .filter((id) => knownIds.has(id))
+    .map((id) => anchors.find((anchor) => anchor.id === id))
+    .filter(Boolean) as VisualAnchor[];
+}
+
 function getCharacterNames(characters: CharacterTemplate[]) {
   return characters.filter(Boolean).map((character) => character.name).join("、");
 }
 
+function buildAnchorPrompt(anchors: VisualAnchor[]) {
+  return anchors
+    .map((anchor) => {
+      const imageText = anchor.images.length
+        ? `Reference labels: ${anchor.images.map((image) => image.label).join(", ")}.`
+        : "No image reference is attached.";
+      return [
+        `${anchorTypeLabel[anchor.type]} / ${anchor.name}`,
+        anchor.description,
+        anchor.usagePrompt,
+        imageText,
+        "Keep this anchor visually consistent when it appears. Use attached images only as visual reference; never draw reference sheets, labels, UI frames, watermarks, or white-background catalog layout unless explicitly requested."
+      ]
+        .filter(Boolean)
+        .join(". ");
+    })
+    .join("\n");
+}
+
 function createPagePrompt(templates: PromptTemplates, characters: CharacterTemplate[], beat: string, shot: string, background: string) {
-  return templates.imagePositive
-    .replace("{{character}}", buildCastPrompt(characters) || "No fixed character sheet is selected. Design characters directly from the story and keep an original consistent comic style.")
-    .replace("{{beat}}", beat)
-    .replace("{{shot}}", shot)
-    .replace("{{background}}", background);
+  return renderPromptTemplate(templates.imagePositive, {
+    character: buildCastPrompt(characters) || "No fixed character sheet is selected. Design characters directly from the story and keep an original consistent comic style.",
+    beat,
+    shot,
+    background
+  });
 }
 
 function withStyleLock(prompt: string, project: ComicProject) {
@@ -238,16 +282,55 @@ function suggestCastCharacterIds(story: string, allCharacters: CharacterTemplate
 }
 
 function createProjectRecord(project: ComicProject): ProjectRecord {
+  const normalizedProject = normalizeProject(project);
   return {
     meta: {
-      id: project.id,
-      name: project.name || "未命名项目",
-      updatedAt: project.updatedAt,
-      pageCount: project.pages.length,
-      doneCount: project.pages.filter((page) => page.status === "done").length
+      id: normalizedProject.id,
+      name: normalizedProject.name || "未命名项目",
+      updatedAt: normalizedProject.updatedAt,
+      pageCount: normalizedProject.pages.length,
+      doneCount: normalizedProject.pages.filter((page) => page.status === "done").length
     },
-    project
+    project: normalizedProject
   };
+}
+
+function normalizeProject(project: ComicProject): ComicProject {
+  return {
+    ...defaultProject,
+    ...project,
+    pages: (project.pages ?? []).map((page) => ({ ...page, anchorIds: page.anchorIds ?? [] })),
+    castCharacterIds: project.castCharacterIds ?? [],
+    deletedCharacterIds: project.deletedCharacterIds ?? [],
+    customCharacters: project.customCharacters ?? [],
+    visualAnchors: (project.visualAnchors ?? []).map((anchor) => ({
+      ...anchor,
+      images: anchor.images ?? [],
+      enabled: anchor.enabled !== false
+    }))
+  };
+}
+
+function normalizeProjectRecords(records: ProjectRecord[]) {
+  return records.map((record) => createProjectRecord(record.project));
+}
+
+function projectAutosaveSignature(records: ProjectRecord[]) {
+  return JSON.stringify(
+    records.map((record) => ({
+      meta: {
+        id: record.meta.id,
+        name: record.meta.name,
+        pageCount: record.meta.pageCount,
+        doneCount: record.meta.doneCount
+      },
+      project: {
+        ...record.project,
+        updatedAt: "",
+        pages: record.project.pages.map(({ progress: _progress, ...page }) => page)
+      }
+    }))
+  );
 }
 
 function touchProject(project: ComicProject, patch: Partial<ComicProject> = {}) {
@@ -278,10 +361,12 @@ function useInitialState() {
       ? draft.providers.map((provider) => ({ ...defaultProvider, ...provider, apiKey: "" }))
       : [draft?.provider ? { ...defaultProvider, ...draft.provider, apiKey: "" } : defaultProvider];
     const savedProviders = hydrateProvidersFromCache(savedProvidersWithoutKeys);
+    const project = normalizeProject(draft?.project ?? defaultProject);
+    const projects = normalizeProjectRecords(draft?.projects ?? [createProjectRecord(project)]);
     return {
-      project: draft?.project ?? defaultProject,
-      projects: draft?.projects ?? [createProjectRecord(draft?.project ?? defaultProject)],
-      activeProjectId: draft?.activeProjectId ?? draft?.project?.id ?? defaultProject.id,
+      project,
+      projects,
+      activeProjectId: draft?.activeProjectId ?? project.id,
       providers: savedProviders,
       activeProviderId: draft?.activeProviderId ?? savedProviders[0].id,
       models: draft?.models ?? defaultModels,
@@ -295,6 +380,12 @@ function ratioClass(ratio: ExportRatio) {
   if (ratio === "1:1") return "aspect-square";
   if (ratio === "4:5") return "aspect-[4/5]";
   return "aspect-[3/4]";
+}
+
+function imageSizeForRatio(ratio: ExportRatio) {
+  if (ratio === "1:1") return "1024x1024";
+  if (ratio === "4:5") return "1024x1280";
+  return "1024x1536";
 }
 
 function statusClass(status: PageStatus) {
@@ -381,6 +472,62 @@ function CharacterMultiSelect({
             </span>
             <span className="min-w-0 flex-1 truncate text-xs font-medium">{character.name}</span>
             {active ? <Check className="h-3.5 w-3.5 shrink-0" /> : null}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function AnchorMultiSelect({
+  anchors,
+  selectedIds,
+  onChange,
+  compact = false
+}: {
+  anchors: VisualAnchor[];
+  selectedIds: string[];
+  onChange: (ids: string[]) => void;
+  compact?: boolean;
+}) {
+  function toggle(anchorId: string) {
+    const next = selectedIds.includes(anchorId)
+      ? selectedIds.filter((id) => id !== anchorId)
+      : [...selectedIds, anchorId];
+    onChange(next);
+  }
+
+  if (!anchors.length) {
+    return (
+      <div className="rounded-md border border-dashed bg-[#fbfaf6] p-3 text-xs leading-5 text-muted-foreground">
+        当前项目还没有素材锚点。可以在素材页上传产品白图、道具或固定场景。
+      </div>
+    );
+  }
+
+  return (
+    <div className={compact ? "grid grid-cols-2 gap-2" : "grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-2"}>
+      {anchors.map((anchor) => {
+        const active = selectedIds.includes(anchor.id);
+        const preview = anchor.primaryImageUrl ?? anchor.images[0]?.url;
+        return (
+          <button
+            type="button"
+            key={anchor.id}
+            title={`${active ? "移除" : "添加"}素材锚点：${anchor.name}`}
+            className={`flex min-w-0 items-center gap-2 rounded-md border p-2 text-left transition ${
+              active ? "border-teal-500 bg-teal-50" : "border-[#ded8cc] bg-white hover:bg-[#f7f3ea]"
+            }`}
+            onClick={() => toggle(anchor.id)}
+          >
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded border bg-white">
+              {preview ? <img src={preview} alt={anchor.name} className="h-full w-full object-contain" /> : <Layers3 className="h-4 w-4 text-teal-600" />}
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-xs font-medium">{anchor.name}</span>
+              <span className="block truncate text-[11px] text-muted-foreground">{anchorTypeLabel[anchor.type]}</span>
+            </span>
+            {active ? <Check className="h-4 w-4 shrink-0 text-teal-600" /> : null}
           </button>
         );
       })}
@@ -541,6 +688,7 @@ function StudioView({
   canUseApi,
   plannerModeLabel,
   plannerModeDescription,
+  onRatioChange,
   openStoryboard
 }: {
   project: ComicProject;
@@ -552,6 +700,7 @@ function StudioView({
   canUseApi: boolean;
   plannerModeLabel: string;
   plannerModeDescription: string;
+  onRatioChange: (ratio: ExportRatio) => void;
   openStoryboard: () => void;
 }) {
   const allCharacters = getAllCharacters(project);
@@ -617,7 +766,7 @@ function StudioView({
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                 <div className="min-w-0">
                   <Label>画面比例</Label>
-                  <Select value={project.exportRatio} onValueChange={(value) => setProject((prev) => ({ ...prev, exportRatio: value as ExportRatio }))}>
+                  <Select value={project.exportRatio} onValueChange={(value) => onRatioChange(value as ExportRatio)}>
                     <SelectTrigger className="mt-1 min-w-0 bg-white" title="选择漫画页面比例">
                       <SelectValue />
                     </SelectTrigger>
@@ -751,11 +900,11 @@ function StudioView({
             {heroPage?.imageUrl ? (
               <motion.div
                 key={heroPage.id + heroPage.imageUrl}
-                className={`relative w-[min(100%,420px,42vh)] overflow-hidden rounded-md bg-white shadow-2xl ${ratioClass(heroRatio)}`}
+                className="w-[min(100%,420px,42vh)]"
                 initial={{ opacity: 0, y: 20 }}
                 animate={{ opacity: 1, y: 0 }}
               >
-                <img src={heroPage.imageUrl} alt={heroPage.title} className="absolute inset-0 h-full w-full object-contain" />
+                <ComicImageFrame src={heroPage.imageUrl} alt={heroPage.title} ratio={heroRatio} fit="contain" className="rounded-md bg-white shadow-2xl" />
               </motion.div>
             ) : heroPage ? (
               <div className={`flex w-[min(100%,420px,42vh)] flex-col items-center justify-center rounded-md border border-[#ded8cc] bg-white p-8 text-center ${ratioClass(heroRatio)}`}>
@@ -827,7 +976,7 @@ function StudioView({
                   >
                     <div className={`relative overflow-hidden rounded border border-[#ded8cc] bg-white ${ratioClass(page.ratio)}`}>
                       {page.imageUrl ? (
-                        <img src={page.imageUrl} alt={page.title} className="absolute inset-0 h-full w-full object-cover" />
+                        <ComicImageFrame src={page.imageUrl} alt={page.title} ratio={page.ratio} fit="cover" className="absolute inset-0 h-full w-full" />
                       ) : (
                         <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-[11px] text-zinc-500">
                           {page.status === "generating" ? <Loader2 className="h-5 w-5 animate-spin" /> : <ImagePlus className="h-5 w-5" />}
@@ -928,7 +1077,6 @@ function StoryboardView({
           {project.pages.map((page, index) => (
             <motion.article
               key={page.id}
-              layout
               className={`group overflow-hidden rounded-lg border bg-white shadow-sm transition ${
                 project.selectedPageId === page.id ? "border-teal-500 ring-2 ring-teal-500/20" : "hover:border-teal-400"
               }`}
@@ -949,7 +1097,7 @@ function StoryboardView({
                 }}
               >
                 {page.imageUrl ? (
-                  <img src={page.imageUrl} alt={page.title} className="h-full w-full object-cover" />
+                  <ComicImageFrame src={page.imageUrl} alt={page.title} ratio={page.ratio} fit="cover" className="absolute inset-0 h-full w-full" />
                 ) : (
                   <div className="flex h-full flex-col items-center justify-center gap-2 text-xs text-muted-foreground">
                     {page.status === "generating" ? <Loader2 className="h-7 w-7 animate-spin" /> : <ImagePlus className="h-7 w-7" />}
@@ -978,6 +1126,11 @@ function StoryboardView({
                   {getPageCharacters(project, page).map((character) => (
                     <Badge key={character.id} className="max-w-full border-teal-100 bg-teal-50 text-[11px] text-teal-800">
                       <span className="truncate">{character.name}</span>
+                    </Badge>
+                  ))}
+                  {getPageAnchors(project, page).map((anchor) => (
+                    <Badge key={anchor.id} className="max-w-full border-amber-100 bg-amber-50 text-[11px] text-amber-800">
+                      <span className="truncate">{anchor.name}</span>
                     </Badge>
                   ))}
                 </div>
@@ -1099,10 +1252,12 @@ function CharactersView({
   onToast: (title: string, description: string) => void;
   addLog: (entry: Omit<AppLogEntry, "id" | "time">) => void;
 }) {
-  const [isGeneratingCharacter, setIsGeneratingCharacter] = useState(false);
+  const [generatingCharacterIds, setGeneratingCharacterIds] = useState<Set<string>>(() => new Set());
+  const generatingCharacterIdsRef = useRef<Set<string>>(new Set());
   const [previewImage, setPreviewImage] = useState<{ url: string; title: string } | undefined>();
   const allCharacters = getAllCharacters(project);
   const selectedCharacter = allCharacters.find((item) => item.id === project.selectedCharacterId) ?? allCharacters[0];
+  const isSelectedCharacterGenerating = selectedCharacter ? generatingCharacterIds.has(selectedCharacter.id) : false;
   const referenceCount = selectedCharacter?.referenceImages?.length ?? 0;
   const mainImageUrl = selectedCharacter?.characterSheetUrl ?? selectedCharacter?.referenceImages?.[0]?.url;
   const importableCharacters = projects
@@ -1174,6 +1329,17 @@ function CharactersView({
     patchCharacterById(selectedCharacter.id, patch);
   }
 
+  function setCharacterGenerating(characterId: string, isGenerating: boolean) {
+    const next = new Set(generatingCharacterIdsRef.current);
+    if (isGenerating) {
+      next.add(characterId);
+    } else {
+      next.delete(characterId);
+    }
+    generatingCharacterIdsRef.current = next;
+    setGeneratingCharacterIds(next);
+  }
+
   function deleteCharacter(characterId: string) {
     setProject((prev) => {
       const deletedIds = new Set([...(prev.deletedCharacterIds ?? []), characterId]);
@@ -1229,12 +1395,16 @@ function CharactersView({
     if (!targetCharacter || !files?.length) return;
     const createdAt = new Date().toISOString();
     const images = await Promise.all(
-      Array.from(files).map(async (file, index) => ({
-        id: nowId("ref"),
-        label: file.name.replace(/\.[^.]+$/, "") || `参考图 ${index + 1}`,
-        url: await fileToDataUrl(file),
-        createdAt
-      }))
+      Array.from(files).map(async (file, index) => {
+        const rawUrl = await fileToDataUrl(file);
+        const url = await persistImageAsset(project.id, rawUrl, `character-${characterId}-reference-${index + 1}-${file.name}`);
+        return {
+          id: nowId("ref"),
+          label: file.name.replace(/\.[^.]+$/, "") || `参考图 ${index + 1}`,
+          url: url ?? rawUrl,
+          createdAt
+        };
+      })
     );
     patchCharacterById(characterId, {
       referenceImages: [...(targetCharacter.referenceImages ?? []), ...images]
@@ -1244,18 +1414,32 @@ function CharactersView({
   function removeReferenceImage(characterId: string, imageId: string) {
     const targetCharacter = findCharacter(characterId);
     if (!targetCharacter) return;
+    const removedImage = (targetCharacter.referenceImages ?? []).find((image) => image.id === imageId);
+    const referenceImages = (targetCharacter.referenceImages ?? []).filter((image) => image.id !== imageId);
+    const characterSheetUrl = removedImage?.url === targetCharacter.characterSheetUrl ? referenceImages[0]?.url : targetCharacter.characterSheetUrl;
     patchCharacterById(characterId, {
-      referenceImages: (targetCharacter.referenceImages ?? []).filter((image) => image.id !== imageId)
+      referenceImages,
+      characterSheetUrl
     });
+  }
+
+  function setPrimaryReferenceImage(characterId: string, imageId: string) {
+    const targetCharacter = findCharacter(characterId);
+    const image = targetCharacter?.referenceImages?.find((item) => item.id === imageId);
+    if (!targetCharacter || !image) return;
+    patchCharacterById(characterId, { characterSheetUrl: image.url });
+    onToast("已设置主参考", `后续漫画页生成会优先使用「${image.label}」。`);
   }
 
   async function generateCharacterSheet(characterId: string) {
     const targetCharacter = findCharacter(characterId);
     if (!targetCharacter) return;
-    setIsGeneratingCharacter(true);
+    if (generatingCharacterIdsRef.current.has(characterId)) return;
+    setCharacterGenerating(characterId, true);
+    const projectId = project.id;
     let characterSheetUrl = "";
     let label = "角色设定图";
-    addLog({ level: "info", module: "image", action: "character-start", message: `开始生成人设图：${targetCharacter.name}`, projectId: project.id, detail: imageModel.model });
+    addLog({ level: "info", module: "image", action: "character-start", message: `开始生成人设图：${targetCharacter.name}`, projectId, detail: imageModel.model });
     try {
       if (!imageProvider.apiKey.trim()) throw new Error("图片模型渠道还没有配置 API Key。");
       const page: ComicPage = {
@@ -1277,29 +1461,45 @@ function CharactersView({
         versions: []
       };
       characterSheetUrl = await generateImageWithNewApi({ provider: imageProvider, model: imageModel, page, characters: [targetCharacter], purpose: "character-sheet" });
+      characterSheetUrl = (await persistImageAsset(projectId, characterSheetUrl, `character-${characterId}-sheet-${nowId("asset")}`)) ?? characterSheetUrl;
       label = "API 角色设定图";
+      setProject((prev) => {
+        if (prev.id !== projectId) return prev;
+        const current = getAllCharacters(prev).find((character) => character.id === characterId);
+        if (!current) return prev;
+        const createdAt = new Date().toISOString();
+        const updated: CharacterTemplate = {
+          ...current,
+          id: characterId,
+          characterSheetUrl,
+          referenceImages: [
+            ...(current.referenceImages ?? []),
+            {
+              id: nowId("ref"),
+              label,
+              url: characterSheetUrl,
+              createdAt
+            }
+          ],
+          updatedAt: createdAt
+        };
+        const exists = (prev.customCharacters ?? []).some((character) => character.id === characterId);
+        return {
+          ...prev,
+          customCharacters: exists
+            ? (prev.customCharacters ?? []).map((character) => (character.id === characterId ? updated : character))
+            : [...(prev.customCharacters ?? []), updated],
+          updatedAt: createdAt
+        };
+      });
+      addLog({ level: "success", module: "image", action: "character-done", message: `人设图生成完成：${targetCharacter.name}`, projectId });
     } catch (error) {
       const message = error instanceof Error ? error.message : "图片模型生成失败。";
       onToast("人设图生成失败", message);
-      addLog({ level: "error", module: "image", action: "character-failed", message: `人设图生成失败：${targetCharacter.name}`, projectId: project.id, detail: message });
-      return;
+      addLog({ level: "error", module: "image", action: "character-failed", message: `人设图生成失败：${targetCharacter.name}`, projectId, detail: message });
     } finally {
-      setIsGeneratingCharacter(false);
+      setCharacterGenerating(characterId, false);
     }
-
-    patchCharacterById(characterId, {
-      characterSheetUrl,
-      referenceImages: [
-        ...(targetCharacter.referenceImages ?? []),
-        {
-          id: nowId("ref"),
-          label,
-          url: characterSheetUrl,
-          createdAt: new Date().toISOString()
-        }
-      ]
-    });
-    addLog({ level: "success", module: "image", action: "character-done", message: `人设图生成完成：${targetCharacter.name}`, projectId: project.id });
   }
 
   return (
@@ -1354,6 +1554,7 @@ function CharactersView({
           {allCharacters.map((character) => {
             const active = project.selectedCharacterId === character.id;
             const preview = character.characterSheetUrl ?? character.referenceImages?.[0]?.url;
+            const isCharacterGenerating = generatingCharacterIds.has(character.id);
             return (
               <button
                 type="button"
@@ -1368,7 +1569,15 @@ function CharactersView({
                   {preview ? <img src={preview} alt={character.name} className="h-full w-full object-contain" /> : <Palette className="m-3 h-6 w-6 text-teal-600" />}
                 </div>
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-medium">{character.name}</div>
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="truncate text-sm font-medium">{character.name}</div>
+                    {isCharacterGenerating ? (
+                      <span className="inline-flex shrink-0 items-center gap-1 rounded border border-teal-200 bg-teal-50 px-1.5 py-0.5 text-[10px] text-teal-700">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        生成中
+                      </span>
+                    ) : null}
+                  </div>
                   <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{character.description}</p>
                   <div className="mt-1 text-[11px] text-zinc-500">{character.referenceImages?.length ?? 0} 张参考图</div>
                 </div>
@@ -1409,9 +1618,9 @@ function CharactersView({
               </div>
 
               <div className="mt-4 grid grid-cols-2 gap-2">
-                <Button onClick={() => generateCharacterSheet(selectedCharacter.id)} disabled={isGeneratingCharacter}>
-                  {isGeneratingCharacter ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-                  生成人设图
+                <Button onClick={() => generateCharacterSheet(selectedCharacter.id)} disabled={isSelectedCharacterGenerating}>
+                  {isSelectedCharacterGenerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+                  {isSelectedCharacterGenerating ? "正在生成" : "生成人设图"}
                 </Button>
                 <Button variant="outline" asChild>
                   <label className="cursor-pointer" title="上传人设参考图">
@@ -1459,24 +1668,39 @@ function CharactersView({
                 </div>
                 {selectedCharacter.referenceImages?.length ? (
                   <div className="grid grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-3">
-                    {selectedCharacter.referenceImages.map((image) => (
-                      <div key={image.id} className="overflow-hidden rounded-md border bg-white">
-                        <button
-                          type="button"
-                          title={`放大查看参考图：${image.label}`}
-                          className="block aspect-[3/4] w-full bg-[#f7f3ea]"
-                          onClick={() => setPreviewImage({ url: image.url, title: image.label })}
-                        >
-                          <img src={image.url} alt={image.label} className="h-full w-full object-contain" />
-                        </button>
-                        <div className="flex items-center justify-between gap-2 p-2">
-                          <span className="min-w-0 truncate text-xs font-medium">{image.label}</span>
-                          <Button size="sm" variant="ghost" aria-label={`删除参考图：${image.label}`} onClick={() => removeReferenceImage(selectedCharacter.id, image.id)}>
-                            <X className="h-3.5 w-3.5" />
-                          </Button>
+                    {selectedCharacter.referenceImages.map((image) => {
+                      const isPrimary = image.url === selectedCharacter.characterSheetUrl;
+                      return (
+                        <div key={image.id} className="overflow-hidden rounded-md border bg-white">
+                          <button
+                            type="button"
+                            title={`放大查看参考图：${image.label}`}
+                            className="relative block aspect-[3/4] w-full bg-[#f7f3ea]"
+                            onClick={() => setPreviewImage({ url: image.url, title: image.label })}
+                          >
+                            <img src={image.url} alt={image.label} className="h-full w-full object-contain" />
+                            {isPrimary ? <Badge className="absolute left-2 top-2 border-emerald-200 bg-emerald-50 text-[10px] text-emerald-700">主参考</Badge> : null}
+                          </button>
+                          <div className="flex items-center justify-between gap-2 p-2">
+                            <span className="min-w-0 truncate text-xs font-medium">{image.label}</span>
+                            <div className="flex shrink-0 items-center gap-1">
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                aria-label={`设为主参考：${image.label}`}
+                                disabled={isPrimary}
+                                onClick={() => setPrimaryReferenceImage(selectedCharacter.id, image.id)}
+                              >
+                                <Check className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button size="sm" variant="ghost" aria-label={`删除参考图：${image.label}`} onClick={() => removeReferenceImage(selectedCharacter.id, image.id)}>
+                                <X className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 ) : (
                   <div className="rounded-md border border-dashed bg-[#f7f3ea] p-5 text-sm text-muted-foreground">还没有参考图。可以上传正面/侧面/背面图，或点击“生成人设图”先保存一张设定图。</div>
@@ -1529,45 +1753,320 @@ function CharactersView({
   );
 }
 
-function WorkflowView({ provider, models, workflow }: { provider: ApiProvider; models: ModelConfig[]; workflow: WorkflowNodeConfig[] }) {
-  const workflowSteps = [
-    { id: "outline", title: "剧情 / 大纲", desc: "理解故事，生成结构化漫画大纲。", icon: Wand2 },
-    { id: "storyboard", title: "分页 / 分镜", desc: "AI 自动或手动决定竖屏页数。", icon: SquareStack },
-    { id: "image", title: "图片生成", desc: "并发调用图片模型，逐页回填。", icon: ImagePlus },
-    { id: "export", title: "阅读 / 导出", desc: "翻页预览、长图拼接、ZIP 下载。", icon: ArrowDownToLine }
-  ];
+function AnchorsView({
+  project,
+  setProject,
+  onToast
+}: {
+  project: ComicProject;
+  setProject: React.Dispatch<React.SetStateAction<ComicProject>>;
+  onToast: (title: string, description: string) => void;
+}) {
+  const [previewImage, setPreviewImage] = useState<{ url: string; title: string } | undefined>();
+  const anchors = project.visualAnchors ?? [];
+  const selectedAnchor = anchors.find((item) => item.id === project.selectedAnchorId) ?? anchors[0];
+  const mainImageUrl = selectedAnchor?.primaryImageUrl ?? selectedAnchor?.images[0]?.url;
+
+  function patchAnchor(anchorId: string, patch: Partial<VisualAnchor>) {
+    setProject((prev) => ({
+      ...prev,
+      visualAnchors: (prev.visualAnchors ?? []).map((anchor) => (
+        anchor.id === anchorId ? { ...anchor, ...patch, updatedAt: new Date().toISOString() } : anchor
+      )),
+      updatedAt: new Date().toISOString()
+    }));
+  }
+
+  function createAnchor() {
+    const createdAt = new Date().toISOString();
+    const anchor: VisualAnchor = {
+      id: nowId("anchor"),
+      name: "新素材锚点",
+      type: "product",
+      description: "填写这个产品、道具、场景或 Logo 的稳定视觉特征。",
+      usagePrompt: "Keep the same shape, color, material, logo placement and proportions across pages.",
+      images: [],
+      enabled: true,
+      createdAt,
+      updatedAt: createdAt
+    };
+    setProject((prev) => ({
+      ...prev,
+      selectedAnchorId: anchor.id,
+      visualAnchors: [...(prev.visualAnchors ?? []), anchor],
+      updatedAt: createdAt
+    }));
+  }
+
+  function deleteAnchor(anchorId: string) {
+    setProject((prev) => {
+      const visualAnchors = (prev.visualAnchors ?? []).filter((anchor) => anchor.id !== anchorId);
+      return {
+        ...prev,
+        selectedAnchorId: prev.selectedAnchorId === anchorId ? visualAnchors[0]?.id : prev.selectedAnchorId,
+        visualAnchors,
+        pages: prev.pages.map((page) => ({ ...page, anchorIds: (page.anchorIds ?? []).filter((id) => id !== anchorId) })),
+        updatedAt: new Date().toISOString()
+      };
+    });
+  }
+
+  async function uploadAnchorImages(anchorId: string, files: FileList | null) {
+    const targetAnchor = anchors.find((anchor) => anchor.id === anchorId);
+    if (!targetAnchor || !files?.length) return;
+    const createdAt = new Date().toISOString();
+    const images = await Promise.all(
+      Array.from(files).map(async (file, index) => {
+        const rawUrl = await fileToDataUrl(file);
+        const url = await persistImageAsset(project.id, rawUrl, `anchor-${anchorId}-image-${index + 1}-${file.name}`);
+        return {
+          id: nowId("anchor_image"),
+          label: file.name.replace(/\.[^.]+$/, "") || `锚点图 ${index + 1}`,
+          url: url ?? rawUrl,
+          createdAt
+        };
+      })
+    );
+    patchAnchor(anchorId, {
+      images: [...targetAnchor.images, ...images],
+      primaryImageUrl: targetAnchor.primaryImageUrl ?? images[0]?.url
+    });
+  }
+
+  function setPrimaryAnchorImage(anchorId: string, imageId: string) {
+    const targetAnchor = anchors.find((anchor) => anchor.id === anchorId);
+    const image = targetAnchor?.images.find((item) => item.id === imageId);
+    if (!targetAnchor || !image) return;
+    patchAnchor(anchorId, { primaryImageUrl: image.url });
+    onToast("已设置主参考", `后续绑定「${targetAnchor.name}」的页面会优先使用「${image.label}」。`);
+  }
+
+  function removeAnchorImage(anchorId: string, imageId: string) {
+    const targetAnchor = anchors.find((anchor) => anchor.id === anchorId);
+    if (!targetAnchor) return;
+    const removedImage = targetAnchor.images.find((image) => image.id === imageId);
+    const images = targetAnchor.images.filter((image) => image.id !== imageId);
+    const primaryImageUrl = removedImage?.url === targetAnchor.primaryImageUrl ? images[0]?.url : targetAnchor.primaryImageUrl;
+    patchAnchor(anchorId, { images, primaryImageUrl });
+  }
 
   return (
-    <div className="h-full overflow-auto p-5 scrollbar-thin">
-      <div className="mb-5">
-        <h2 className="text-lg font-semibold">流程配置</h2>
-        <p className="text-sm text-muted-foreground">第一版固定主流程，但每个生成节点都可以绑定独立模型和提示词。</p>
-      </div>
-      <div className="grid grid-cols-4 gap-4">
-        {workflowSteps.map((step, index) => {
-          const node = workflow.find((item) => item.id === step.id);
-          const model = models.find((item) => item.id === node?.modelId);
-          const Icon = step.icon;
-          return (
-            <section key={step.id} className="rounded-lg border bg-white p-4 shadow-sm">
-              <div className="flex items-center justify-between">
-                <div className="flex h-10 w-10 items-center justify-center rounded-md bg-teal-50 text-teal-700 dark:bg-teal-400/15 dark:text-teal-200">
-                  <Icon className="h-5 w-5" />
+    <div className="grid h-full grid-cols-[minmax(280px,340px)_minmax(0,1fr)] gap-4 overflow-hidden p-5">
+      <section className="flex min-h-0 flex-col rounded-lg border bg-white p-4 shadow-sm">
+        <div className="mb-4 flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h2 className="text-sm font-semibold">素材锚点</h2>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">产品白图、道具、场景和 Logo，用于保持跨页一致。</p>
+          </div>
+          <Button size="sm" onClick={createAnchor}>
+            <ImagePlus className="h-4 w-4" />
+            新建
+          </Button>
+        </div>
+        <div className="min-h-0 flex-1 space-y-2 overflow-auto pr-1 scrollbar-thin">
+          {anchors.map((anchor) => {
+            const active = selectedAnchor?.id === anchor.id;
+            const preview = anchor.primaryImageUrl ?? anchor.images[0]?.url;
+            return (
+              <button
+                type="button"
+                key={anchor.id}
+                title={`选择素材锚点：${anchor.name}`}
+                className={`flex w-full min-w-0 gap-3 rounded-md border p-2 text-left transition ${
+                  active ? "border-teal-500 bg-teal-50" : "border-[#ded8cc] bg-white hover:bg-[#f7f3ea]"
+                }`}
+                onClick={() => setProject((prev) => ({ ...prev, selectedAnchorId: anchor.id, updatedAt: new Date().toISOString() }))}
+              >
+                <div className="h-16 w-12 shrink-0 overflow-hidden rounded border bg-[#f7f3ea]">
+                  {preview ? <img src={preview} alt={anchor.name} className="h-full w-full object-contain" /> : <Layers3 className="m-3 h-6 w-6 text-teal-600" />}
                 </div>
-                <Badge className="border border-zinc-200 bg-transparent text-zinc-700">0{index + 1}</Badge>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="truncate text-sm font-medium">{anchor.name}</div>
+                    <Badge className="shrink-0 border-zinc-200 bg-white text-[10px] text-zinc-700">{anchorTypeLabel[anchor.type]}</Badge>
+                  </div>
+                  <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{anchor.description}</p>
+                  <div className="mt-1 text-[11px] text-zinc-500">{anchor.images.length} 张参考图</div>
+                </div>
+              </button>
+            );
+          })}
+          {!anchors.length ? (
+            <div className="rounded-md border border-dashed bg-[#f7f3ea] p-5 text-sm leading-6 text-muted-foreground">
+              还没有素材锚点。先新建一个“产品”锚点，然后上传白底图或参考图。
+            </div>
+          ) : null}
+        </div>
+      </section>
+
+      <section className="min-h-0 overflow-auto rounded-lg border bg-white p-4 shadow-sm scrollbar-thin">
+        {selectedAnchor ? (
+          <div className="grid min-h-full grid-cols-[minmax(360px,0.95fr)_minmax(360px,1.05fr)] gap-4">
+            <div className="min-w-0">
+              <div className="mb-4 flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h2 className="truncate text-lg font-semibold">{selectedAnchor.name}</h2>
+                  <p className="mt-1 text-sm text-muted-foreground">绑定到分镜页后，参考图会随该页一起传给图片模型。</p>
+                </div>
+                <Badge className="border border-zinc-200 bg-transparent text-zinc-700">{selectedAnchor.images.length} 张参考图</Badge>
               </div>
-              <h3 className="mt-4 text-sm font-semibold">{step.title}</h3>
-              <p className="mt-2 min-h-[40px] text-xs leading-5 text-muted-foreground">{step.desc}</p>
-              <div className="mt-4 rounded-md bg-[#f7f3ea] p-3 text-xs">
-                <div className="text-muted-foreground">Provider</div>
-                <div className="mt-1 truncate font-medium">{provider.providerName}</div>
-                <div className="mt-3 text-muted-foreground">Model</div>
-                <div className="mt-1 truncate font-medium">{model?.model ?? "未绑定"}</div>
+              <div className="overflow-hidden rounded-lg border bg-[#f7f3ea]">
+                {mainImageUrl ? (
+                  <button
+                    type="button"
+                    title={`放大查看素材：${selectedAnchor.name}`}
+                    className="block aspect-[4/5] w-full bg-white"
+                    onClick={() => setPreviewImage({ url: mainImageUrl, title: selectedAnchor.name })}
+                  >
+                    <img src={mainImageUrl} alt={selectedAnchor.name} className="h-full w-full object-contain" />
+                  </button>
+                ) : (
+                  <div className="flex aspect-[4/5] flex-col items-center justify-center gap-3 text-center text-sm text-muted-foreground">
+                    <Layers3 className="h-10 w-10 text-teal-600" />
+                    <div>暂无素材参考图</div>
+                  </div>
+                )}
               </div>
-            </section>
-          );
-        })}
-      </div>
+              <div className="mt-4">
+                <Button variant="outline" asChild className="w-full">
+                  <label className="cursor-pointer" title="上传素材参考图">
+                    <ImagePlus className="h-4 w-4" />
+                    上传参考图
+                    <input className="hidden" type="file" accept="image/*" multiple onChange={(event) => uploadAnchorImages(selectedAnchor.id, event.target.files)} />
+                  </label>
+                </Button>
+              </div>
+            </div>
+
+            <div className="min-w-0 space-y-4">
+              <div className="grid grid-cols-[minmax(0,1fr)_150px] gap-3">
+                <div>
+                  <Label>素材名称</Label>
+                  <Input className="mt-1" value={selectedAnchor.name} onChange={(event) => patchAnchor(selectedAnchor.id, { name: event.target.value })} />
+                </div>
+                <div>
+                  <Label>类型</Label>
+                  <Select value={selectedAnchor.type} onValueChange={(value) => patchAnchor(selectedAnchor.id, { type: value as VisualAnchorType })}>
+                    <SelectTrigger className="mt-1" title="选择素材锚点类型">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {Object.entries(anchorTypeLabel).map(([value, label]) => (
+                        <SelectItem key={value} value={value}>{label}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              <div className="flex items-center justify-between rounded-md border bg-[#fbfaf6] p-3">
+                <div>
+                  <div className="text-xs font-medium">参与生成</div>
+                  <div className="mt-1 text-[11px] text-muted-foreground">关闭后即使页面绑定了它，也不会传给图片接口。</div>
+                </div>
+                <Switch checked={selectedAnchor.enabled !== false} onCheckedChange={(checked) => patchAnchor(selectedAnchor.id, { enabled: checked })} />
+              </div>
+              <div>
+                <Label>稳定视觉描述</Label>
+                <Textarea
+                  className="mt-1 h-24 resize-none leading-6"
+                  value={selectedAnchor.description}
+                  onChange={(event) => patchAnchor(selectedAnchor.id, { description: event.target.value })}
+                />
+              </div>
+              <div>
+                <Label>使用说明</Label>
+                <Textarea
+                  className="mt-1 h-24 resize-none font-mono text-xs leading-5"
+                  value={selectedAnchor.usagePrompt}
+                  onChange={(event) => patchAnchor(selectedAnchor.id, { usagePrompt: event.target.value })}
+                />
+              </div>
+              <div>
+                <div className="mb-2 flex items-center justify-between">
+                  <Label>参考图列表</Label>
+                  <span className="text-xs text-muted-foreground">白图、实拍图、包装图都可以放这里</span>
+                </div>
+                {selectedAnchor.images.length ? (
+                  <div className="grid grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-3">
+                    {selectedAnchor.images.map((image) => {
+                      const isPrimary = image.url === selectedAnchor.primaryImageUrl;
+                      return (
+                        <div key={image.id} className="overflow-hidden rounded-md border bg-white">
+                          <button
+                            type="button"
+                            title={`放大查看参考图：${image.label}`}
+                            className="relative block aspect-[3/4] w-full bg-[#f7f3ea]"
+                            onClick={() => setPreviewImage({ url: image.url, title: image.label })}
+                          >
+                            <img src={image.url} alt={image.label} className="h-full w-full object-contain" />
+                            {isPrimary ? <Badge className="absolute left-2 top-2 border-emerald-200 bg-emerald-50 text-[10px] text-emerald-700">主参考</Badge> : null}
+                          </button>
+                          <div className="flex items-center justify-between gap-2 p-2">
+                            <span className="min-w-0 truncate text-xs font-medium">{image.label}</span>
+                            <div className="flex shrink-0 items-center gap-1">
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                aria-label={`设为主参考：${image.label}`}
+                                disabled={isPrimary}
+                                onClick={() => setPrimaryAnchorImage(selectedAnchor.id, image.id)}
+                              >
+                                <Check className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button size="sm" variant="ghost" aria-label={`删除参考图：${image.label}`} onClick={() => removeAnchorImage(selectedAnchor.id, image.id)}>
+                                <X className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="rounded-md border border-dashed bg-[#f7f3ea] p-5 text-sm text-muted-foreground">还没有参考图。建议产品先上传白底图或清晰实拍图。</div>
+                )}
+              </div>
+              <div className="flex justify-end">
+                <Button variant="destructive" onClick={() => deleteAnchor(selectedAnchor.id)}>
+                  删除这个素材
+                </Button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">暂无素材锚点</div>
+        )}
+      </section>
+
+      <AnimatePresence>
+        {previewImage ? (
+          <motion.div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/70 p-6"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setPreviewImage(undefined)}
+          >
+            <motion.div
+              className="relative max-h-full max-w-5xl overflow-hidden rounded-lg border bg-white shadow-2xl"
+              initial={{ scale: 0.96, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.96, y: 10 }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex h-12 items-center justify-between border-b px-4">
+                <div className="min-w-0 truncate text-sm font-semibold">{previewImage.title}</div>
+                <Button size="icon" variant="ghost" onClick={() => setPreviewImage(undefined)} aria-label="关闭图片预览">
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+              <div className="flex max-h-[calc(100vh-120px)] max-w-[calc(100vw-48px)] items-center justify-center bg-[#f7f3ea] p-3">
+                <img src={previewImage.url} alt={previewImage.title} className="max-h-[calc(100vh-150px)] max-w-full object-contain" />
+              </div>
+            </motion.div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
     </div>
   );
 }
@@ -1599,8 +2098,12 @@ function SettingsView({
 }) {
   const [isFetchingModels, setIsFetchingModels] = useState(false);
   const [modelFetchError, setModelFetchError] = useState<string | undefined>();
+  const [activeTemplateKey, setActiveTemplateKey] = useState<keyof PromptTemplates>("imagePositive");
+  const templateTextAreaRef = useRef<HTMLTextAreaElement | null>(null);
   const provider = providers.find((item) => item.id === activeProviderId) ?? providers[0] ?? defaultProvider;
   const providerModels = provider.models ?? [];
+  const activeTemplateValue = templates[activeTemplateKey];
+  const activeTemplateVariables = promptTemplateVariables[activeTemplateKey];
 
   async function refreshProviderModels() {
     setIsFetchingModels(true);
@@ -1675,6 +2178,24 @@ function SettingsView({
 
   function updateModel(modelId: string, patch: Partial<ModelConfig>) {
     setModels((prev) => prev.map((item) => (item.id === modelId ? { ...item, ...patch } : item)));
+  }
+
+  function updateTemplate(key: keyof PromptTemplates, value: string) {
+    setTemplates((prev) => ({ ...prev, [key]: value }));
+  }
+
+  function insertTemplateVariable(name: string) {
+    const token = `{{${name}}}`;
+    const textarea = templateTextAreaRef.current;
+    const start = textarea?.selectionStart ?? activeTemplateValue.length;
+    const end = textarea?.selectionEnd ?? activeTemplateValue.length;
+    const nextValue = `${activeTemplateValue.slice(0, start)}${token}${activeTemplateValue.slice(end)}`;
+    updateTemplate(activeTemplateKey, nextValue);
+    window.requestAnimationFrame(() => {
+      templateTextAreaRef.current?.focus();
+      const nextCursor = start + token.length;
+      templateTextAreaRef.current?.setSelectionRange(nextCursor, nextCursor);
+    });
   }
 
   return (
@@ -1931,18 +2452,75 @@ function SettingsView({
       </div>
 
       <section className="mt-4 rounded-lg border bg-white p-4 shadow-sm">
-        <h2 className="text-sm font-semibold">提示词模板</h2>
-        <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(320px,1fr))] gap-4">
-          {Object.entries(templates).map(([key, value]) => (
-            <div key={key}>
-              <Label>{key}</Label>
-              <Textarea
-                className="mt-1 h-36 resize-none font-mono text-xs"
-                value={value}
-                onChange={(event) => setTemplates((prev) => ({ ...prev, [key]: event.target.value }))}
-              />
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-semibold">提示词模板</h2>
+            <p className="mt-1 text-xs text-muted-foreground">选择模板后，可以像 Dify 一样点变量插入到光标位置。</p>
+          </div>
+          <Button size="sm" variant="outline" onClick={() => setTemplates(recommendedPromptTemplates)}>
+            套用推荐模板
+          </Button>
+        </div>
+        <div className="mt-4 grid grid-cols-[minmax(220px,280px)_minmax(0,1fr)_minmax(260px,340px)] gap-4">
+          <div className="space-y-2">
+            {(Object.keys(templates) as Array<keyof PromptTemplates>).map((key) => (
+              <button
+                type="button"
+                key={key}
+                className={`w-full rounded-md border p-3 text-left transition ${
+                  activeTemplateKey === key ? "border-teal-500 bg-teal-50" : "border-[#ded8cc] bg-white hover:bg-[#f7f3ea]"
+                }`}
+                onClick={() => setActiveTemplateKey(key)}
+              >
+                <div className="text-sm font-medium">{promptTemplateLabel[key]}</div>
+                <div className="mt-1 text-[11px] text-zinc-500">{promptTemplateNodeLabel[key]}</div>
+                <div className="mt-1 font-mono text-[11px] text-zinc-400">{key}</div>
+              </button>
+            ))}
+          </div>
+          <div className="min-w-0">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div>
+                <Label>{promptTemplateLabel[activeTemplateKey]}</Label>
+                <div className="mt-1 text-[11px] text-zinc-500">{promptTemplateNodeLabel[activeTemplateKey]} · {activeTemplateKey}</div>
+              </div>
+              <Badge className="border border-zinc-200 bg-transparent text-zinc-700">{activeTemplateVariables.length} 个变量</Badge>
             </div>
-          ))}
+            <Textarea
+              ref={templateTextAreaRef}
+              className="h-[420px] resize-none font-mono text-xs leading-5"
+              value={activeTemplateValue}
+              onChange={(event) => updateTemplate(activeTemplateKey, event.target.value)}
+            />
+          </div>
+          <aside className="rounded-md border bg-[#fbfaf6] p-3">
+            <div className="text-xs font-semibold">可插入内容</div>
+            <div className="mt-1 text-[11px] leading-5 text-zinc-500">点击变量会插入 <span className="font-mono text-zinc-700">{"{{变量}}"}</span>，生成时由对应节点自动替换。</div>
+            <div className="mt-3 space-y-2">
+              {activeTemplateVariables.length ? activeTemplateVariables.map((variable) => (
+                <button
+                  type="button"
+                  key={variable.name}
+                  className="w-full rounded-md border border-[#ded8cc] bg-white p-2 text-left transition hover:border-teal-400 hover:bg-teal-50"
+                  onClick={() => insertTemplateVariable(variable.name)}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium">{variable.label}</span>
+                    <span className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-[10px] text-zinc-600">{"{{"}{variable.name}{"}}"}</span>
+                  </div>
+                  <div className="mt-1 text-[11px] text-zinc-500">{variable.source}</div>
+                  <p className="mt-1 text-[11px] leading-4 text-zinc-600">{variable.description}</p>
+                </button>
+              )) : (
+                <div className="rounded-md border border-dashed bg-white p-4 text-xs leading-5 text-zinc-500">
+                  这个模板通常直接写负向词，不需要动态变量。
+                </div>
+              )}
+            </div>
+            <div className="mt-4 rounded-md border border-teal-200 bg-teal-50 p-2 text-[11px] leading-5 text-teal-800">
+              大纲/分镜变量来自创作台和文本规划节点；图片变量来自当前分镜页；重绘变量来自当前页和你的修改要求。
+            </div>
+          </aside>
         </div>
       </section>
     </div>
@@ -1965,7 +2543,7 @@ function ReaderPreview({
   const activePage = pages[Math.min(index, Math.max(0, pages.length - 1))];
 
   return (
-    <section className="flex h-full min-h-0 flex-col rounded-lg border bg-white shadow-sm">
+    <section className="flex h-full min-h-0 min-w-0 flex-col rounded-lg border bg-white shadow-sm">
       <div className="flex h-14 items-center justify-between gap-3 border-b px-4">
         <div className="min-w-0">
           <div className="text-sm font-semibold">阅读预览</div>
@@ -1983,11 +2561,11 @@ function ReaderPreview({
         </div>
       </div>
       {mode === "paged" ? (
-        <div className="grid min-h-0 flex-1 grid-cols-[56px_1fr_56px] items-center gap-3 bg-[#f7f3ea] p-4">
+        <div className="grid min-h-0 flex-1 grid-cols-[56px_minmax(0,1fr)_56px] items-center gap-3 overflow-hidden bg-[#f7f3ea] p-4">
           <ToolButton label="上一页" disabled={!pages.length || index === 0} onClick={() => setIndex((prev) => Math.max(0, prev - 1))}>
             <ChevronLeft className="h-4 w-4" />
           </ToolButton>
-          <div className="flex min-h-0 justify-center">
+          <div className="flex h-full min-h-0 w-full items-center justify-center overflow-hidden">
             {activePage ? (
               <AnimatePresence mode="wait">
                 <motion.img
@@ -2045,7 +2623,7 @@ function ProjectsView({
   addLog: (entry: Omit<AppLogEntry, "id" | "time">) => void;
 }) {
   function switchProject(record: ProjectRecord) {
-    setProject(record.project);
+    setProject(normalizeProject(record.project));
     setActiveProjectId(record.meta.id);
     addLog({ level: "info", module: "project", action: "switch", message: `已切换到项目：${record.meta.name}`, projectId: record.meta.id });
   }
@@ -2053,7 +2631,7 @@ function ProjectsView({
   function renameProject(record: ProjectRecord, name: string) {
     const nextProject = touchProject(record.project, { name });
     setProjects((prev) => prev.map((item) => (item.meta.id === record.meta.id ? createProjectRecord(nextProject) : item)));
-    if (record.meta.id === activeProjectId) setProject(nextProject);
+    if (record.meta.id === activeProjectId) setProject(normalizeProject(nextProject));
   }
 
   function createProject() {
@@ -2070,12 +2648,13 @@ function ProjectsView({
       castCharacterIds: [],
       deletedCharacterIds: [],
       customCharacters: [],
+      visualAnchors: [],
       longImageUrl: undefined,
       updatedAt: now
     };
     const record = createProjectRecord(nextProject);
     setProjects((prev) => [record, ...prev]);
-    setProject(nextProject);
+    setProject(normalizeProject(nextProject));
     setActiveProjectId(nextProject.id);
     addLog({ level: "success", module: "project", action: "create", message: "已新建项目", projectId: nextProject.id });
   }
@@ -2092,7 +2671,7 @@ function ProjectsView({
     };
     const nextRecord = createProjectRecord(nextProject);
     setProjects((prev) => [nextRecord, ...prev]);
-    setProject(nextProject);
+    setProject(normalizeProject(nextProject));
     setActiveProjectId(nextProject.id);
     addLog({ level: "success", module: "project", action: "duplicate", message: "已复制项目", projectId: nextProject.id });
   }
@@ -2102,7 +2681,7 @@ function ProjectsView({
     const nextProjects = projects.filter((item) => item.meta.id !== record.meta.id);
     setProjects(nextProjects);
     if (record.meta.id === activeProjectId) {
-      setProject(nextProjects[0].project);
+      setProject(normalizeProject(nextProjects[0].project));
       setActiveProjectId(nextProjects[0].meta.id);
     }
     addLog({ level: "warn", module: "project", action: "delete", message: `已删除项目：${record.meta.name}`, projectId: record.meta.id });
@@ -2261,9 +2840,10 @@ function ExportView({
     try {
       const longImageUrl = await createLongComicImage(donePages);
       if (!longImageUrl) return;
-      setProject((prev) => ({ ...prev, longImageUrl, readerMode: "long", updatedAt: new Date().toISOString() }));
+      const savedLongImageUrl = (await persistImageAsset(project.id, longImageUrl, `project-${project.id}-long-${nowId("asset")}`)) ?? longImageUrl;
+      setProject((prev) => ({ ...prev, longImageUrl: savedLongImageUrl, readerMode: "long", updatedAt: new Date().toISOString() }));
       if (download) {
-        const blob = await imageUrlToBlob(longImageUrl);
+        const blob = await imageUrlToBlob(savedLongImageUrl);
         const filename = `${project.name || "comic"}-${ratio}-long.png`;
         downloadBlob(blob, filename);
         await saveLongImageNative(filename, longImageUrl);
@@ -2346,7 +2926,9 @@ function Inspector({
   const selectedPage = project.pages.find((page) => page.id === project.selectedPageId) ?? project.pages[0];
   const [previewImage, setPreviewImage] = useState<{ url: string; title: string } | undefined>();
   const allCharacters = getAllCharacters(project);
+  const enabledAnchors = getEnabledAnchors(project);
   const selectedPageCharacters = selectedPage ? getPageCharacters(project, selectedPage) : [];
+  const selectedPageAnchors = selectedPage ? getPageAnchors(project, selectedPage) : [];
 
   function updateSelectedPage(patch: Partial<ComicPage>) {
     if (!selectedPage) return;
@@ -2456,6 +3038,18 @@ function Inspector({
                 />
               </div>
             </div>
+            <div>
+              <Label>本页素材锚点</Label>
+              <div className="mt-2">
+                <AnchorMultiSelect
+                  anchors={enabledAnchors}
+                  selectedIds={selectedPage.anchorIds ?? selectedPageAnchors.map((anchor) => anchor.id)}
+                  onChange={(ids) => updateSelectedPage({ anchorIds: ids })}
+                  compact
+                />
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">绑定后，参考图模式会把这些素材图和人设图一起传给图片模型。</p>
+            </div>
             <div className="grid grid-cols-1 gap-3">
               <div>
                 <Label>背景</Label>
@@ -2543,13 +3137,14 @@ export function App() {
   const [isPlanning, setIsPlanning] = useState(false);
   const [isDark, setIsDark] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [isHydratingDraft, setIsHydratingDraft] = useState(true);
+  const [isRestoringDraft, setIsRestoringDraft] = useState(false);
   const [hasHydratedDraft, setHasHydratedDraft] = useState(false);
   const [hasHydratedKeys, setHasHydratedKeys] = useState(false);
   const [toast, setToast] = useState<{ title: string; description: string } | undefined>();
   const [logs, setLogs] = useState<AppLogEntry[]>(() => loadProjectLogs(initial.activeProjectId));
   const activeProjectIdRef = useRef(activeProjectId);
   const keySaveBaselineRef = useRef<string>();
+  const providersRef = useRef(providers);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", isDark);
@@ -2563,6 +3158,10 @@ export function App() {
     activeProjectIdRef.current = activeProjectId;
     setLogs(loadProjectLogs(activeProjectId));
   }, [activeProjectId]);
+
+  useEffect(() => {
+    providersRef.current = providers;
+  }, [providers]);
 
   function addLog(entry: Omit<AppLogEntry, "id" | "time">) {
     const targetProjectId = entry.projectId ?? activeProjectIdRef.current;
@@ -2605,37 +3204,59 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     async function hydrateNativeDraft() {
-      let keyRefs = providers.map((provider) => provider.apiKeyRef);
+      setIsRestoringDraft(true);
       try {
         const nativeDraft = await loadNativeDraft();
         if (!cancelled && nativeDraft) {
-          setProject(nativeDraft.project);
-          setProjects(nativeDraft.projects);
+          const restoredProject = normalizeProject(nativeDraft.project);
+          const restoredProjects = normalizeProjectRecords(nativeDraft.projects).map((record) => (
+            record.meta.id === restoredProject.id ? createProjectRecord(restoredProject) : record
+          ));
+          setProject(restoredProject);
+          setProjects(restoredProjects);
           setActiveProjectId(nativeDraft.activeProjectId);
-          addLog({ level: "success", module: "app", action: "hydrate", message: "本地项目和配置已恢复", projectId: nativeDraft.activeProjectId });
           const restoredProviders = (nativeDraft.providers?.length ? nativeDraft.providers : [nativeDraft.provider]).map((provider) => ({
             ...defaultProvider,
             ...provider,
             apiKey: ""
           }));
           const cachedProviders = hydrateProvidersFromCache(restoredProviders);
-          keyRefs = cachedProviders.map((provider) => provider.apiKeyRef);
+          providersRef.current = cachedProviders;
           setProviders(cachedProviders);
           setActiveProviderId(nativeDraft.activeProviderId ?? restoredProviders[0].id);
           setModels(nativeDraft.models);
           setTemplates(nativeDraft.templates);
           setWorkflow(nativeDraft.workflow);
+          persistProjectsImageAssets(restoredProjects)
+            .then((migratedProjects) => {
+              if (cancelled || migratedProjects === restoredProjects) return;
+              const migratedProject = migratedProjects.find((record) => record.meta.id === nativeDraft.activeProjectId)?.project ?? migratedProjects[0]?.project;
+              setProjects(migratedProjects);
+              if (migratedProject) setProject(migratedProject);
+              saveNativeDraft(
+                migratedProjects,
+                nativeDraft.activeProjectId,
+                providersRef.current,
+                nativeDraft.activeProviderId ?? restoredProviders[0].id,
+                nativeDraft.models,
+                nativeDraft.templates,
+                nativeDraft.workflow
+              ).catch((error) => console.warn("Migrated draft save failed", error));
+            })
+            .catch((error) => console.warn("Image asset migration failed", error));
         }
       } catch (error) {
         console.warn("Native draft hydration failed", error);
-        addLog({ level: "warn", module: "app", action: "hydrate", message: "本地项目恢复失败，已使用当前草稿或默认项目", detail: error instanceof Error ? error.message : String(error), projectId: activeProjectId });
       } finally {
         if (!cancelled) {
-          setIsHydratingDraft(false);
+          setIsRestoringDraft(false);
           setHasHydratedDraft(true);
         }
       }
-
+      await hydrateApiKeysFor(providersRef.current);
+    }
+    async function hydrateApiKeysFor(providerList: ApiProvider[]) {
+      const keyRefs = Array.from(new Set(providerList.map((provider) => provider.apiKeyRef)));
       try {
         const providerKeys = await loadApiKeySecrets(keyRefs);
         if (!cancelled) {
@@ -2658,6 +3279,10 @@ export function App() {
     };
   }, []);
 
+  const providerConfigMemoSignature = useMemo(() => providerConfigSignature(providers), [providers]);
+  const providerSecretMemoSignature = useMemo(() => providerSecretSignature(providers), [providers]);
+  const autosaveProjectSignature = useMemo(() => projectAutosaveSignature(projects), [projects]);
+
   useEffect(() => {
     if (!hasHydratedDraft) return;
     const timeout = window.setTimeout(() => {
@@ -2665,15 +3290,15 @@ export function App() {
         console.warn("Auto save failed", error);
         addLog({ level: "error", module: "app", action: "autosave", message: "自动保存失败", detail: error instanceof Error ? error.message : String(error), projectId: activeProjectId });
       });
-    }, 800);
+    }, 1500);
     return () => window.clearTimeout(timeout);
-  }, [hasHydratedDraft, projects, activeProjectId, providerConfigSignature(providers), activeProviderId, models, templates, workflow]);
+  }, [hasHydratedDraft, autosaveProjectSignature, activeProjectId, providerConfigMemoSignature, activeProviderId, models, templates, workflow]);
 
   useEffect(() => {
     const secrets = providers.map((item) => ({ keyRef: item.apiKeyRef, apiKey: item.apiKey }));
-    const signature = providerSecretSignature(providers);
-    cacheApiKeySecrets(secrets);
+    const signature = providerSecretMemoSignature;
     if (!hasHydratedKeys) return;
+    cacheApiKeySecrets(secrets);
     if (keySaveBaselineRef.current === undefined) {
       keySaveBaselineRef.current = signature;
       return;
@@ -2687,19 +3312,19 @@ export function App() {
         .catch((error) => console.warn("API key save failed", error));
     }, 1200);
     return () => window.clearTimeout(timeout);
-  }, [hasHydratedKeys, providerSecretSignature(providers)]);
+  }, [hasHydratedKeys, providerSecretMemoSignature, providers]);
 
-  const doneCount = project.pages.filter((page) => page.status === "done").length;
-  const allCharacters = getAllCharacters(project);
-  const selectedCharacter = allCharacters.find((item) => item.id === project.selectedCharacterId) ?? allCharacters[0];
-  const castCharacters = getCastCharacters(project);
-  const outlineNode = workflow.find((node) => node.id === "outline");
-  const imageNode = workflow.find((node) => node.id === "image");
-  const textModel = models.find((model) => model.id === outlineNode?.modelId) ?? models.find((model) => model.kind === "text") ?? defaultModels[0];
-  const imageModel = models.find((model) => model.id === imageNode?.modelId) ?? models.find((model) => model.kind === "image") ?? defaultModels[1];
-  const provider = providers.find((item) => item.id === activeProviderId) ?? providers[0] ?? defaultProvider;
-  const textProvider = providers.find((item) => item.id === textModel.providerId) ?? provider;
-  const imageProvider = providers.find((item) => item.id === imageModel.providerId) ?? provider;
+  const doneCount = useMemo(() => project.pages.filter((page) => page.status === "done").length, [project.pages]);
+  const allCharacters = useMemo(() => getAllCharacters(project), [project.customCharacters, project.deletedCharacterIds]);
+  const selectedCharacter = useMemo(() => allCharacters.find((item) => item.id === project.selectedCharacterId) ?? allCharacters[0], [allCharacters, project.selectedCharacterId]);
+  const castCharacters = useMemo(() => getCastCharacters(project), [project.customCharacters, project.deletedCharacterIds, project.castCharacterIds, project.selectedCharacterId]);
+  const outlineNode = useMemo(() => workflow.find((node) => node.id === "outline"), [workflow]);
+  const imageNode = useMemo(() => workflow.find((node) => node.id === "image"), [workflow]);
+  const textModel = useMemo(() => models.find((model) => model.id === outlineNode?.modelId) ?? models.find((model) => model.kind === "text") ?? defaultModels[0], [models, outlineNode?.modelId]);
+  const imageModel = useMemo(() => models.find((model) => model.id === imageNode?.modelId) ?? models.find((model) => model.kind === "image") ?? defaultModels[1], [models, imageNode?.modelId]);
+  const provider = useMemo(() => providers.find((item) => item.id === activeProviderId) ?? providers[0] ?? defaultProvider, [providers, activeProviderId]);
+  const textProvider = useMemo(() => providers.find((item) => item.id === textModel.providerId) ?? provider, [providers, textModel.providerId, provider]);
+  const imageProvider = useMemo(() => providers.find((item) => item.id === imageModel.providerId) ?? provider, [providers, imageModel.providerId, provider]);
   const isApiPlannerReady = Boolean(textProvider.apiKey?.trim());
   const plannerModeLabel = isApiPlannerReady ? `API · ${textModel.model}` : "本地规则";
   const plannerModeDescription = isApiPlannerReady
@@ -2708,6 +3333,22 @@ export function App() {
 
   function showToast(title: string, description: string) {
     setToast({ title, description });
+  }
+
+  function handleRatioChange(ratio: ExportRatio) {
+    updateProjectState((prev) => ({
+      ...prev,
+      exportRatio: ratio,
+      pages: prev.pages.map((page) => (page.imageUrl ? page : { ...page, ratio })),
+      updatedAt: new Date().toISOString()
+    }));
+    setModels((prev) =>
+      prev.map((model) => (
+        model.kind === "image" && model.id === imageModel.id
+          ? { ...model, size: imageSizeForRatio(ratio) }
+          : model
+      ))
+    );
   }
 
   function handleSuggestCast() {
@@ -2770,12 +3411,12 @@ export function App() {
         }
         if (!result) throw lastError instanceof Error ? lastError : new Error("文本模型规划失败");
       } else {
-        result = planComicFromStory(project.storyInput, castCharacters, project.exportRatio, project.targetPageCount);
+        result = planComicFromStory(project.storyInput, castCharacters, project.exportRatio, project.targetPageCount, templates);
       }
       updateProjectState((prev) => ({
         ...prev,
         outline: result.outline,
-        pages: result.pages.map((page) => ({ ...page, prompt: withStyleLock(page.prompt, prev) })),
+        pages: result.pages.map((page) => ({ ...page, anchorIds: page.anchorIds ?? [], prompt: withStyleLock(page.prompt, prev) })),
         selectedPageId: result.pages[0]?.id,
         longImageUrl: undefined,
         updatedAt: new Date().toISOString()
@@ -2785,11 +3426,11 @@ export function App() {
       showToast(isApiPlannerReady ? "API 分镜已生成" : "本地规则分镜已生成", `已拆分为 ${result.pages.length} 页。`);
       addLog({ level: "success", module: "planner", action: "done", message: `分镜已生成 ${result.pages.length} 页`, projectId: project.id, detail: plannerModeLabel });
     } catch (error) {
-      const result = planComicFromStory(project.storyInput, castCharacters, project.exportRatio, project.targetPageCount);
+      const result = planComicFromStory(project.storyInput, castCharacters, project.exportRatio, project.targetPageCount, templates);
       updateProjectState((prev) => ({
         ...prev,
         outline: result.outline,
-        pages: result.pages.map((page) => ({ ...page, prompt: withStyleLock(page.prompt, prev) })),
+        pages: result.pages.map((page) => ({ ...page, anchorIds: page.anchorIds ?? [], prompt: withStyleLock(page.prompt, prev) })),
         selectedPageId: result.pages[0]?.id,
         longImageUrl: undefined,
         updatedAt: new Date().toISOString()
@@ -2832,13 +3473,22 @@ export function App() {
     }));
   }
 
+  function getPageAnchorsForGeneration(page: ComicPage) {
+    return getPageAnchors(project, page);
+  }
+
   function isAcceptedButUnfinishedImageError(error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
-    return /524|timeout|timed out|aborted|bad_response_status_code|openai_error|gateway/i.test(message);
+    return /524|timeout|timed out|aborted|bad_response_status_code|openai_error|gateway|body-read-failed|error decoding response body|读取 API 响应失败|failed to read API response body/i.test(message);
   }
 
   async function generateOne(page: ComicPage, mock: boolean) {
-    const pageForGeneration = { ...page, prompt: withStyleLock(page.prompt, project) };
+    const pageAnchors = getPageAnchorsForGeneration(page);
+    const anchorPrompt = buildAnchorPrompt(pageAnchors);
+    const pageForGeneration = {
+      ...page,
+      prompt: withStyleLock(anchorPrompt ? `${page.prompt}\n\nVisual anchors:\n${anchorPrompt}` : page.prompt, project)
+    };
     addLog({ level: "info", module: "image", action: mock ? "mock-start" : "api-start", message: `开始生成第 ${page.pageNumber} 页`, projectId: project.id, pageId: page.id, detail: mock ? "mock" : imageModel.model });
     patchPage(page.id, { status: "generating", progress: 12, error: undefined, ...(mock ? {} : { imageUrl: undefined }) });
     for (const progress of [28, 44, 63, 78]) {
@@ -2865,7 +3515,7 @@ export function App() {
               pageId: page.id,
               detail: `${imageProvider.providerName} / ${imageModel.model} / ${imageModel.endpointMode}`
             });
-            imageUrl = await generateImageWithNewApi({ provider: imageProvider, model: imageModel, page: pageForGeneration, characters: pageCharacters });
+            imageUrl = await generateImageWithNewApi({ provider: imageProvider, model: imageModel, page: pageForGeneration, characters: pageCharacters, anchors: pageAnchors });
             break;
           } catch (error) {
             lastError = error;
@@ -2896,6 +3546,7 @@ export function App() {
         }
         if (!imageUrl) throw lastError instanceof Error ? lastError : new Error("生成失败");
       }
+      imageUrl = (await persistImageAsset(project.id, imageUrl, `page-${page.pageNumber}-${page.id}-${nowId("asset")}`)) ?? imageUrl;
       const version = createImageVersion(pageForGeneration, imageUrl);
       patchPage(page.id, {
         status: "done",
@@ -3001,6 +3652,7 @@ export function App() {
       shot,
       character: getCharacterNames(pageCharacters),
       characterIds: pageCharacters.map((character) => character.id),
+      anchorIds: [],
       background,
       ratio: project.exportRatio,
       prompt: withStyleLock(createPagePrompt(templates, pageCharacters, beat, shot, background), project),
@@ -3028,6 +3680,7 @@ export function App() {
         canUseApi={Boolean(imageProvider.apiKey)}
         plannerModeLabel={plannerModeLabel}
         plannerModeDescription={plannerModeDescription}
+        onRatioChange={handleRatioChange}
         openStoryboard={() => setActiveTab("storyboard")}
       />
     );
@@ -3046,6 +3699,8 @@ export function App() {
     );
   } else if (activeTab === "characters") {
     content = <CharactersView project={project} projects={projects} setProject={setCurrentProject} imageProvider={imageProvider} imageModel={imageModel} onToast={showToast} addLog={addLog} />;
+  } else if (activeTab === "anchors") {
+    content = <AnchorsView project={project} setProject={setCurrentProject} onToast={showToast} />;
   } else if (activeTab === "projects") {
     content = (
       <ProjectsView
@@ -3057,8 +3712,6 @@ export function App() {
         addLog={addLog}
       />
     );
-  } else if (activeTab === "workflow") {
-    content = <WorkflowView provider={provider} models={models} workflow={workflow} />;
   } else if (activeTab === "settings") {
     content = (
       <SettingsView
@@ -3102,10 +3755,10 @@ export function App() {
         >
           {content}
         </Shell>
-        {isHydratingDraft ? (
+        {isRestoringDraft ? (
           <div className="pointer-events-none fixed right-4 top-4 z-50 flex items-center gap-2 rounded-md border bg-white px-3 py-2 text-sm text-zinc-700 shadow-sm">
             <Loader2 className="h-4 w-4 animate-spin text-teal-600" />
-            正在恢复本地草稿
+            后台同步本地草稿
           </div>
         ) : null}
       </TooltipProvider>

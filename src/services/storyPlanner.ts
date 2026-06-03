@@ -1,6 +1,7 @@
 import { defaultModels, promptTemplates } from "../data/defaults";
 import { nowId } from "../lib/utils";
-import { CharacterTemplate, ComicPage, PlannerResult } from "../types";
+import { CharacterTemplate, ComicPage, PlannerResult, PromptTemplates } from "../types";
+import { renderPromptTemplate } from "./promptVariables";
 
 const defaultBeats = [
   "主角被日常压力困住，故事从一个具体的小麻烦开始。",
@@ -96,7 +97,8 @@ export function planComicFromStory(
   story: string,
   characters: CharacterTemplate[] = [],
   ratio = "3:4",
-  targetPageCount = 8
+  targetPageCount = 8,
+  templates: PromptTemplates = promptTemplates
 ): PlannerResult {
   const cast = characters.filter(Boolean);
   const cleanStory = story.trim() || "一个普通人遇见一只会写便签的小狗，逐渐找回生活节奏。";
@@ -124,11 +126,12 @@ export function planComicFromStory(
     const title = source ? `${stageTitles[index % stageTitles.length]}：${source.slice(0, 12)}` : `第 ${pageNumber} 页`;
     const shot = `${shotTypes[index % shotTypes.length]} 画面重点：${source || beat}`;
     const background = backgroundHints[index % backgroundHints.length];
-    const prompt = promptTemplates.imagePositive
-      .replace("{{character}}", buildCastPrompt(pageCharacters) || "No fixed character sheet is selected. Design characters directly from the story while keeping a clean original comic style.")
-      .replace("{{beat}}", beat)
-      .replace("{{shot}}", shot)
-      .replace("{{background}}", background);
+    const prompt = renderPromptTemplate(templates.imagePositive, {
+      character: buildCastPrompt(pageCharacters) || "No fixed character sheet is selected. Design characters directly from the story while keeping a clean original comic style.",
+      beat,
+      shot,
+      background
+    });
 
     return {
       id: nowId("page"),
@@ -141,7 +144,7 @@ export function planComicFromStory(
       background,
       ratio: ratio as ComicPage["ratio"],
       prompt,
-      negativePrompt: promptTemplates.imageNegative,
+      negativePrompt: templates.imageNegative,
       modelId: defaultModels[1].id,
       status: "draft",
       progress: 0,

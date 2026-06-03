@@ -1,5 +1,6 @@
 import { defaultModels, promptTemplates } from "../data/defaults";
 import { nowId } from "../lib/utils";
+import { renderPromptTemplate } from "./promptVariables";
 import { buildCastPrompt } from "./storyPlanner";
 import { ApiProvider, CharacterTemplate, ComicPage, ExportRatio, ModelConfig, PlannerResult, PromptTemplates } from "../types";
 
@@ -65,11 +66,12 @@ function resolvePageCharacters(page: ApiPlannerPage, characters: CharacterTempla
 }
 
 function pagePrompt(template: PromptTemplates, characters: CharacterTemplate[], page: Required<Omit<ApiPlannerPage, "characterIds" | "characters">>) {
-  return (page.prompt?.trim() || template.imagePositive)
-    .replace("{{character}}", buildCastPrompt(characters))
-    .replace("{{beat}}", page.beat)
-    .replace("{{shot}}", page.shot)
-    .replace("{{background}}", page.background);
+  return renderPromptTemplate(page.prompt?.trim() || template.imagePositive, {
+    character: buildCastPrompt(characters),
+    beat: page.beat,
+    shot: page.shot,
+    background: page.background
+  });
 }
 
 export async function planComicWithNewApi({
@@ -104,6 +106,17 @@ export async function planComicWithNewApi({
   const characterInstruction = cast.length
     ? "每页根据剧情选择一个或多个出场角色，并把角色 id 写入 characterIds。characterIds 只能使用项目演员表里的 id。"
     : "当前没有项目演员表。每页 characterIds 必须返回空数组，不要编造角色 id。";
+  const templateValues = {
+    input: story,
+    story,
+    character: buildCastPrompt(cast),
+    cast: castList,
+    ratio,
+    targetPageCount: manualPageCount ?? "AI 自动",
+    outline: "请先根据大纲生成提示词和用户故事生成结构化大纲，再将该大纲拆成分镜。"
+  };
+  const outlinePrompt = renderPromptTemplate(templates.outline, templateValues);
+  const storyboardPrompt = renderPromptTemplate(templates.storyboard, templateValues);
 
   const response = await fetch(endpoint(provider.baseUrl), {
     method: "POST",
@@ -122,7 +135,7 @@ export async function planComicWithNewApi({
         },
         {
           role: "user",
-          content: `${templates.outline}\n\n${templates.storyboard}\n\n项目演员表：\n${castList}\n\n图片比例：${ratio}\n${pageCountInstruction}\n用户故事：${story}\n\n通用要求：适合抖音/小红书翻页图集。${characterInstruction} 只输出 JSON，不要输出 Markdown。`
+          content: `${outlinePrompt}\n\n${storyboardPrompt}\n\n项目演员表：\n${castList}\n\n图片比例：${ratio}\n${pageCountInstruction}\n用户故事：${story}\n\n通用要求：适合抖音/小红书翻页图集。${characterInstruction} 只输出 JSON，不要输出 Markdown。`
         }
       ]
     })

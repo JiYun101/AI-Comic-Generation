@@ -1,4 +1,4 @@
-export type WorkspaceTab = "studio" | "storyboard" | "characters" | "projects" | "workflow" | "settings" | "logs" | "export";
+export type WorkspaceTab = "studio" | "storyboard" | "characters" | "anchors" | "projects" | "settings" | "logs" | "export";
 
 export type EndpointMode = "chat-text" | "images" | "image-edits" | "chat-image";
 
@@ -71,6 +71,28 @@ export interface CharacterReferenceImage {
   createdAt: string;
 }
 
+export type VisualAnchorType = "product" | "prop" | "scene" | "logo" | "style";
+
+export interface VisualAnchorImage {
+  id: string;
+  label: string;
+  url: string;
+  createdAt: string;
+}
+
+export interface VisualAnchor {
+  id: string;
+  name: string;
+  type: VisualAnchorType;
+  description: string;
+  usagePrompt: string;
+  images: VisualAnchorImage[];
+  primaryImageUrl?: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface PageImageVersion {
   id: string;
   imageUrl: string;
@@ -98,6 +120,7 @@ export interface ComicPage {
   shot: string;
   character: string;
   characterIds: string[];
+  anchorIds?: string[];
   background: string;
   ratio: ExportRatio;
   prompt: string;
@@ -120,9 +143,11 @@ export interface ComicProject {
   pages: ComicPage[];
   selectedPageId?: string;
   selectedCharacterId: string;
+  selectedAnchorId?: string;
   castCharacterIds: string[];
   deletedCharacterIds: string[];
   customCharacters: CharacterTemplate[];
+  visualAnchors: VisualAnchor[];
   exportRatio: ExportRatio;
   targetPageCount: number;
   concurrency: number;

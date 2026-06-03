@@ -1,4 +1,4 @@
-import { ApiProvider, CharacterTemplate, ComicPage, EndpointMode, ModelConfig } from "../types";
+import { ApiProvider, CharacterTemplate, ComicPage, EndpointMode, ModelConfig, VisualAnchor } from "../types";
 
 type ImageGenerationPurpose = "comic-page" | "character-sheet";
 
@@ -7,6 +7,7 @@ interface ImageGenerationInput {
   model: ModelConfig;
   page: ComicPage;
   characters?: CharacterTemplate[];
+  anchors?: VisualAnchor[];
   purpose?: ImageGenerationPurpose;
   signal?: AbortSignal;
 }
@@ -71,6 +72,15 @@ function friendlyApiError(message: string, url = "") {
     return [
       "图片编辑接口参数不兼容。",
       "当前模型不支持 input_fidelity 参数。客户端已移除该参数，请重新生成。",
+      `原始错误：${message}`
+    ].join("\n");
+  }
+  if (/body-read-failed|error decoding response body|读取 API 响应失败|failed to read API response body/i.test(message)) {
+    return [
+      "客户端读取图片响应体失败。",
+      "这通常发生在上游已经生成完成，但返回体编码、压缩或连接分块异常，客户端没能把最终响应读出来。",
+      "你在上游日志里看到消费成功是合理的；这类错误不适合自动重试，否则可能重复扣费。",
+      "处理方法：先把该图片模型的请求超时调到 600 秒；如果仍出现，建议让渠道返回标准 JSON 图片 URL/base64，或更换更稳定的图片渠道。",
       `原始错误：${message}`
     ].join("\n");
   }
@@ -250,25 +260,45 @@ function getReferenceImageUrls(characters: CharacterTemplate[], purpose: ImageGe
   for (const character of characters) {
     const perCharacter = new Map<string, string>();
     const referenceImages = character.referenceImages ?? [];
-    const orderedImages =
+    const orderedUrls =
       purpose === "comic-page"
         ? [
-            ...referenceImages.filter((image) => !isSheetLikeReference(image.label)),
-            ...referenceImages.filter((image) => isSheetLikeReference(image.label))
+            character.characterSheetUrl,
+            ...referenceImages.filter((image) => !isSheetLikeReference(image.label)).map((image) => image.url),
+            ...referenceImages.filter((image) => isSheetLikeReference(image.label)).map((image) => image.url)
           ]
-        : referenceImages;
+        : [...referenceImages.map((image) => image.url), character.characterSheetUrl];
 
-    for (const image of orderedImages) {
-      perCharacter.set(image.url, image.url);
+    for (const url of orderedUrls) {
+      if (url) perCharacter.set(url, url);
     }
-    if (purpose !== "comic-page" || !perCharacter.size) {
-      if (character.characterSheetUrl) perCharacter.set(character.characterSheetUrl, character.characterSheetUrl);
-    }
+
     for (const url of Array.from(perCharacter.values()).slice(0, 2)) {
       urls.set(url, url);
     }
   }
   return Array.from(urls.values()).slice(0, 6);
+}
+
+function getAnchorReferenceImageUrls(anchors: VisualAnchor[]) {
+  const urls = new Map<string, string>();
+  for (const anchor of anchors.filter((item) => item.enabled !== false)) {
+    const perAnchor = new Map<string, string>();
+    const images = anchor.images ?? [];
+    const orderedUrls = [
+      anchor.primaryImageUrl,
+      ...images.map((image) => image.url)
+    ];
+
+    for (const url of orderedUrls) {
+      if (url) perAnchor.set(url, url);
+    }
+
+    for (const url of Array.from(perAnchor.values()).slice(0, 2)) {
+      urls.set(url, url);
+    }
+  }
+  return Array.from(urls.values()).slice(0, 8);
 }
 
 function referenceGuard(purpose: ImageGenerationPurpose, hasReferences: boolean) {
@@ -498,14 +528,16 @@ export async function fetchProviderModels(provider: ApiProvider, signal?: AbortS
   return models;
 }
 
-export async function generateImageWithNewApi({ provider, model, page, characters = [], purpose = "comic-page", signal }: ImageGenerationInput) {
+export async function generateImageWithNewApi({ provider, model, page, characters = [], anchors = [], purpose = "comic-page", signal }: ImageGenerationInput) {
   const mode: EndpointMode = model.endpointMode === "chat-text" ? provider.endpointMode : model.endpointMode;
   if (!provider.apiKey.trim()) {
     throw new Error("请先配置 API Key，或使用 Mock 生成。");
   }
 
   const characterText = characters.length ? `\n\nPage characters:\n${buildCharacterText(characters)}` : "";
-  const referenceUrls = mode === "chat-image" || mode === "image-edits" ? getReferenceImageUrls(characters, purpose) : [];
+  const referenceUrls = mode === "chat-image" || mode === "image-edits"
+    ? Array.from(new Set([...getReferenceImageUrls(characters, purpose), ...getAnchorReferenceImageUrls(anchors)])).slice(0, 10)
+    : [];
   const prompt = `${page.prompt}${characterText}\n\n${referenceGuard(purpose, referenceUrls.length > 0)}`;
 
   if (mode === "images" || (mode === "image-edits" && !referenceUrls.length)) {

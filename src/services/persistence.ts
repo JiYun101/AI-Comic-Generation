@@ -363,8 +363,9 @@ export async function saveNativeDraft(
   templates: PromptTemplates,
   workflow: WorkflowNodeConfig[]
 ) {
+  saveDraft(projects, activeProjectId, providers, activeProviderId, models, templates, workflow);
+
   if (!isTauriRuntime()) {
-    saveDraft(projects, activeProjectId, providers, activeProviderId, models, templates, workflow);
     return;
   }
 

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
+use std::path::PathBuf;
 use tauri::Manager;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -14,6 +15,23 @@ struct SaveProjectRequest {
 struct SaveLongImageRequest {
     filename: String,
     data_url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveImageAssetRequest {
+    project_id: String,
+    filename: String,
+    data_url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadImageAssetRequest {
+    project_id: String,
+    filename: String,
+    url: String,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -106,11 +124,178 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     Ok(buffer)
 }
 
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let b0 = bytes[index];
+        let b1 = if index + 1 < bytes.len() { bytes[index + 1] } else { 0 };
+        let b2 = if index + 2 < bytes.len() { bytes[index + 2] } else { 0 };
+        output.push(TABLE[(b0 >> 2) as usize] as char);
+        output.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if index + 1 < bytes.len() {
+            output.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if index + 2 < bytes.len() {
+            output.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        index += 3;
+    }
+    output
+}
+
 fn decode_data_url(data_url: &str) -> Result<Vec<u8>, String> {
     let (_, data) = data_url
         .split_once(',')
         .ok_or_else(|| "参考图 data URL 格式不正确。".to_string())?;
     decode_base64(data)
+}
+
+fn image_extension_from_data_url(data_url: &str) -> &'static str {
+    let mime = data_url
+        .split_once(';')
+        .map(|(header, _)| header.trim_start_matches("data:"))
+        .unwrap_or("image/png");
+    if mime.contains("jpeg") || mime.contains("jpg") {
+        "jpg"
+    } else if mime.contains("svg") {
+        "svg"
+    } else if mime.contains("webp") {
+        "webp"
+    } else if mime.contains("gif") {
+        "gif"
+    } else {
+        "png"
+    }
+}
+
+fn image_extension_from_content_type(content_type: Option<&str>, url: &str) -> &'static str {
+    let lowered = content_type.unwrap_or("").to_ascii_lowercase();
+    let url = url.to_ascii_lowercase();
+    if lowered.contains("jpeg") || lowered.contains("jpg") || url.contains(".jpg") || url.contains(".jpeg") {
+        "jpg"
+    } else if lowered.contains("svg") || url.contains(".svg") {
+        "svg"
+    } else if lowered.contains("webp") || url.contains(".webp") {
+        "webp"
+    } else if lowered.contains("gif") || url.contains(".gif") {
+        "gif"
+    } else {
+        "png"
+    }
+}
+
+fn image_mime_from_bytes(content_type: &str, bytes: &[u8]) -> Option<&'static str> {
+    let lowered = content_type.to_ascii_lowercase();
+    if lowered.starts_with("image/png") {
+        Some("image/png")
+    } else if lowered.starts_with("image/jpeg") || lowered.starts_with("image/jpg") {
+        Some("image/jpeg")
+    } else if lowered.starts_with("image/webp") {
+        Some("image/webp")
+    } else if lowered.starts_with("image/gif") {
+        Some("image/gif")
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else {
+        None
+    }
+}
+
+fn safe_segment(value: &str, fallback: &str) -> String {
+    let mut safe = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    while safe.contains("..") {
+        safe = safe.replace("..", ".");
+    }
+    let safe = safe.trim_matches('.');
+    if safe.is_empty() {
+        fallback.to_string()
+    } else {
+        safe.chars().take(96).collect()
+    }
+}
+
+fn ensure_image_filename(filename: &str, extension: &str) -> String {
+    let safe = safe_segment(filename, "image");
+    let lowered = safe.to_ascii_lowercase();
+    if lowered.ends_with(".png") || lowered.ends_with(".jpg") || lowered.ends_with(".jpeg") || lowered.ends_with(".webp") || lowered.ends_with(".gif") || lowered.ends_with(".svg") {
+        safe
+    } else {
+        format!("{safe}.{extension}")
+    }
+}
+
+fn project_asset_dir(app: &tauri::AppHandle, project_id: &str) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("assets")
+        .join(safe_segment(project_id, "project")))
+}
+
+fn write_image_asset(app: tauri::AppHandle, project_id: &str, filename: &str, bytes: Vec<u8>, extension: &str) -> Result<String, String> {
+    let asset_dir = project_asset_dir(&app, project_id)?;
+    fs::create_dir_all(&asset_dir).map_err(|error| error.to_string())?;
+    let path = asset_dir.join(ensure_image_filename(filename, extension));
+    fs::write(&path, bytes).map_err(|error| error.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+async fn read_api_response_payload(response: reqwest::Response, json_preview_limit: usize) -> Result<serde_json::Value, String> {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = response.bytes().await.map_err(|error| {
+        format!(
+            "body-read-failed: failed to read API response body: {error}. Upstream may have completed generation, but the client did not receive the result body. Increase this provider timeout to 600 seconds. This error is not safe to auto retry."
+        )
+    })?;
+
+    if !status.is_success() {
+        let text = String::from_utf8_lossy(&bytes);
+        return Err(format!("API {status}: {}", text.chars().take(500).collect::<String>()));
+    }
+
+    if let Some(mime_type) = image_mime_from_bytes(&content_type, &bytes) {
+        return Ok(serde_json::json!({
+            "data": [
+                {
+                    "url": format!("data:{mime_type};base64,{}", encode_base64(&bytes))
+                }
+            ]
+        }));
+    }
+
+    let text = String::from_utf8_lossy(&bytes);
+    serde_json::from_str(&text).map_err(|_| {
+        let preview = text.trim().chars().take(json_preview_limit).collect::<String>();
+        format!("API did not return JSON. Response preview: {preview}")
+    })
 }
 
 fn error_chain(error: &(dyn Error + 'static)) -> String {
@@ -161,6 +346,42 @@ fn save_long_image(app: tauri::AppHandle, request: SaveLongImageRequest) -> Resu
 }
 
 #[tauri::command]
+fn save_image_asset(app: tauri::AppHandle, request: SaveImageAssetRequest) -> Result<String, String> {
+    let bytes = decode_data_url(&request.data_url)?;
+    let extension = image_extension_from_data_url(&request.data_url);
+    write_image_asset(app, &request.project_id, &request.filename, bytes, extension)
+}
+
+#[tauri::command]
+async fn download_image_asset(app: tauri::AppHandle, request: DownloadImageAssetRequest) -> Result<String, String> {
+    if request.url.trim().is_empty() {
+        return Err("Image URL is empty.".to_string());
+    }
+    let response = api_client(request.timeout_ms.unwrap_or(240_000))?
+        .get(request.url.trim())
+        .send()
+        .await
+        .map_err(|error| format!("Image download failed: {}", error_chain(&error)))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("Image download failed {status}"));
+    }
+    let extension = image_extension_from_content_type(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        &request.url
+    );
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("Read image download failed: {}", error_chain(&error)))?
+        .to_vec();
+    write_image_asset(app, &request.project_id, &request.filename, bytes, extension)
+}
+
+#[tauri::command]
 async fn fetch_provider_models_native(request: FetchModelsRequest) -> Result<serde_json::Value, String> {
     if request.base_url.trim().is_empty() {
         return Err("请先填写渠道 Base URL。".to_string());
@@ -207,18 +428,7 @@ async fn post_api_json_native(request: ApiJsonRequest) -> Result<serde_json::Val
         .send()
         .await
         .map_err(|error| format!("API 请求失败：{}", error_chain(&error)))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|error| format!("读取 API 响应失败：{error}"))?;
-    if !status.is_success() {
-        return Err(format!("API {status}: {}", text.chars().take(500).collect::<String>()));
-    }
-    serde_json::from_str(&text).map_err(|_| {
-        let preview = text.trim().chars().take(160).collect::<String>();
-        format!("API 没有返回 JSON：{preview}")
-    })
+    read_api_response_payload(response, 160).await
 }
 
 #[tauri::command]
@@ -255,18 +465,7 @@ async fn post_api_multipart_native(request: ApiMultipartRequest) -> Result<serde
         .send()
         .await
         .map_err(|error| format!("API 参考图请求失败：{}", error_chain(&error)))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|error| format!("读取 API 响应失败：{error}"))?;
-    if !status.is_success() {
-        return Err(format!("API {status}: {}", text.chars().take(500).collect::<String>()));
-    }
-    serde_json::from_str(&text).map_err(|_| {
-        let preview = text.trim().chars().take(160).collect::<String>();
-        format!("API 没有返回 JSON：{preview}")
-    })
+    read_api_response_payload(response, 160).await
 }
 
 pub fn run() {
@@ -287,6 +486,8 @@ pub fn run() {
             app_ready,
             save_project_snapshot,
             save_long_image,
+            save_image_asset,
+            download_image_asset,
             fetch_provider_models_native,
             post_api_json_native,
             post_api_multipart_native

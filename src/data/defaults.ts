@@ -94,6 +94,7 @@ export const defaultProject: ComicProject = {
   castCharacterIds: [],
   deletedCharacterIds: [],
   customCharacters: [],
+  visualAnchors: [],
   exportRatio: "3:4",
   targetPageCount: 0,
   concurrency: 4,
