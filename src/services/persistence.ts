@@ -75,6 +75,8 @@ function normalizePage(page: ComicProject["pages"][number], castCharacterIds: st
     .join("、");
   return {
     ...page,
+    anchorIds: page.anchorIds ?? [],
+    anchorBindingMode: page.anchorBindingMode ?? "auto",
     characterIds,
     character: page.character || characterNames,
     versions: page.versions ?? [],

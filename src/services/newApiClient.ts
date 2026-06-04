@@ -2,6 +2,9 @@ import { ApiProvider, CharacterTemplate, ComicPage, EndpointMode, ModelConfig, V
 
 type ImageGenerationPurpose = "comic-page" | "character-sheet";
 
+export const MAX_ANCHOR_REFERENCE_IMAGES_PER_ANCHOR = 6;
+const MAX_IMAGE_REFERENCE_URLS = 10;
+
 interface ImageGenerationInput {
   provider: ApiProvider;
   model: ModelConfig;
@@ -285,20 +288,25 @@ function getAnchorReferenceImageUrls(anchors: VisualAnchor[]) {
   for (const anchor of anchors.filter((item) => item.enabled !== false)) {
     const perAnchor = new Map<string, string>();
     const images = anchor.images ?? [];
+    const referenceImages = images.filter((image) => image.useAsReference !== false);
+    const referenceImageUrls = new Set(referenceImages.map((image) => image.url));
+    const primaryImageUrl = anchor.primaryImageUrl && (!images.length || referenceImageUrls.has(anchor.primaryImageUrl))
+      ? anchor.primaryImageUrl
+      : referenceImages[0]?.url;
     const orderedUrls = [
-      anchor.primaryImageUrl,
-      ...images.map((image) => image.url)
+      primaryImageUrl,
+      ...referenceImages.map((image) => image.url)
     ];
 
     for (const url of orderedUrls) {
       if (url) perAnchor.set(url, url);
     }
 
-    for (const url of Array.from(perAnchor.values()).slice(0, 2)) {
+    for (const url of Array.from(perAnchor.values()).slice(0, MAX_ANCHOR_REFERENCE_IMAGES_PER_ANCHOR)) {
       urls.set(url, url);
     }
   }
-  return Array.from(urls.values()).slice(0, 8);
+  return Array.from(urls.values());
 }
 
 function referenceGuard(purpose: ImageGenerationPurpose, hasReferences: boolean) {
@@ -316,6 +324,9 @@ function referenceGuard(purpose: ImageGenerationPurpose, hasReferences: boolean)
     "Final output must be one finished vertical comic page for the story scene, not a character design sheet.",
     hasReferences
       ? "Attached images are visual references only: copy the character identity, face, clothing, palette and proportions, but never reproduce the reference image itself."
+      : "",
+    hasReferences
+      ? "For product, prop, scene or logo references, preserve the same silhouette, geometry, color blocking, material, logo placement and key details; change viewpoint only through perspective, not redesign."
       : "",
     "Do not include character-setting text, reference labels, multi-view layout, front/side/back comparison, design notes, UI panels, screenshots, thumbnails, watermarks, or explanatory captions.",
     "If text is needed, leave a clean blank caption area instead of writing character profile text."
@@ -536,7 +547,7 @@ export async function generateImageWithNewApi({ provider, model, page, character
 
   const characterText = characters.length ? `\n\nPage characters:\n${buildCharacterText(characters)}` : "";
   const referenceUrls = mode === "chat-image" || mode === "image-edits"
-    ? Array.from(new Set([...getReferenceImageUrls(characters, purpose), ...getAnchorReferenceImageUrls(anchors)])).slice(0, 10)
+    ? Array.from(new Set([...getAnchorReferenceImageUrls(anchors), ...getReferenceImageUrls(characters, purpose)])).slice(0, MAX_IMAGE_REFERENCE_URLS)
     : [];
   const prompt = `${page.prompt}${characterText}\n\n${referenceGuard(purpose, referenceUrls.length > 0)}`;
 

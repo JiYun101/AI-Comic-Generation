@@ -77,6 +77,7 @@ export interface VisualAnchorImage {
   id: string;
   label: string;
   url: string;
+  useAsReference?: boolean;
   createdAt: string;
 }
 
@@ -121,6 +122,7 @@ export interface ComicPage {
   character: string;
   characterIds: string[];
   anchorIds?: string[];
+  anchorBindingMode?: "auto" | "manual";
   background: string;
   ratio: ExportRatio;
   prompt: string;

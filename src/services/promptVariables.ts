@@ -44,7 +44,8 @@ export const promptTemplateVariables: Record<PromptTemplateKey, PromptVariable[]
     { name: "character", label: "角色模板", source: "分镜页 / 人设", description: "当前页出场角色的完整外观与一致性设定。" },
     { name: "beat", label: "剧情", source: "分镜页", description: "当前页剧情节拍。" },
     { name: "shot", label: "画面", source: "分镜页", description: "当前页镜头、构图与动作描述。" },
-    { name: "background", label: "背景", source: "分镜页", description: "当前页场景与环境。" }
+    { name: "background", label: "背景", source: "分镜页", description: "当前页场景与环境。" },
+    { name: "anchors", label: "素材锚点", source: "分镜页 / 素材", description: "当前页绑定的产品、道具、场景、Logo 或风格锚点；生成图片时按本页选择动态替换。" }
   ],
   imageNegative: [],
   regenerate: [
@@ -166,4 +167,3 @@ export function renderPromptTemplate(template: string, values: Record<string, st
     return value === undefined || value === "" ? match : String(value);
   });
 }
-

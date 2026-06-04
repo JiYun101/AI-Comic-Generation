@@ -18,6 +18,7 @@ import {
   PanelsTopLeft,
   Palette,
   PanelRight,
+  Pause,
   Play,
   RefreshCw,
   Save,
@@ -40,7 +41,7 @@ import { Toast, ToastDescription, ToastProvider, ToastTitle, ToastViewport } fro
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
 import { ComicImageFrame } from "./components/ComicImageFrame";
 import { createLongComicImage, createMockCharacterSheet, createMockComicImage, imageUrlToBlob } from "./services/mockAssets";
-import { fetchProviderModels, generateImageWithNewApi } from "./services/newApiClient";
+import { MAX_ANCHOR_REFERENCE_IMAGES_PER_ANCHOR, fetchProviderModels, generateImageWithNewApi } from "./services/newApiClient";
 import { saveLongImageNative } from "./services/nativeExport";
 import { persistImageAsset, persistProjectsImageAssets } from "./services/nativeAssets";
 import { promptTemplateLabel, promptTemplateNodeLabel, promptTemplateVariables, recommendedPromptTemplates, renderPromptTemplate } from "./services/promptVariables";
@@ -59,7 +60,6 @@ import {
   saveProjectLogs
 } from "./services/persistence";
 import { buildCastPrompt, planComicFromStory } from "./services/storyPlanner";
-import { runWithConcurrency } from "./services/taskQueue";
 import { planComicWithNewApi } from "./services/textPlannerClient";
 import { downloadBlob, nowId, sleep } from "./lib/utils";
 import {
@@ -228,6 +228,24 @@ function getEnabledAnchors(project: ComicProject) {
   return (project.visualAnchors ?? []).filter((anchor) => anchor.enabled !== false);
 }
 
+function getAnchorReferenceImages(anchor: VisualAnchor) {
+  return (anchor.images ?? []).filter((image) => image.useAsReference !== false);
+}
+
+function pickAnchorPrimaryImageUrl(images: VisualAnchor["images"], primaryImageUrl?: string) {
+  const referenceImages = (images ?? []).filter((image) => image.useAsReference !== false);
+  if (primaryImageUrl && referenceImages.some((image) => image.url === primaryImageUrl)) return primaryImageUrl;
+  return referenceImages[0]?.url;
+}
+
+function getAnchorPrimaryReferenceUrl(anchor: VisualAnchor) {
+  return pickAnchorPrimaryImageUrl(anchor.images, anchor.primaryImageUrl);
+}
+
+function getAnchorPreviewUrl(anchor: VisualAnchor) {
+  return getAnchorPrimaryReferenceUrl(anchor) ?? anchor.primaryImageUrl ?? anchor.images[0]?.url;
+}
+
 function getPageAnchors(project: ComicProject, page: ComicPage) {
   const anchors = getEnabledAnchors(project);
   const knownIds = new Set(anchors.map((anchor) => anchor.id));
@@ -244,20 +262,85 @@ function getCharacterNames(characters: CharacterTemplate[]) {
 function buildAnchorPrompt(anchors: VisualAnchor[]) {
   return anchors
     .map((anchor) => {
-      const imageText = anchor.images.length
-        ? `Reference labels: ${anchor.images.map((image) => image.label).join(", ")}.`
-        : "No image reference is attached.";
+      const referenceImages = getAnchorReferenceImages(anchor);
+      const imageText = referenceImages.length
+        ? `Selected reference labels: ${referenceImages.map((image) => image.label).join(", ")}.`
+        : "No selected image reference is attached.";
       return [
-        `${anchorTypeLabel[anchor.type]} / ${anchor.name}`,
+        `STRICT VISUAL ANCHOR - ${anchorTypeLabel[anchor.type]} / ${anchor.name}`,
         anchor.description,
         anchor.usagePrompt,
         imageText,
-        "Keep this anchor visually consistent when it appears. Use attached images only as visual reference; never draw reference sheets, labels, UI frames, watermarks, or white-background catalog layout unless explicitly requested."
+        "This anchor is a structure lock, not a loose style hint. Prioritize preserving this object's structure over decorative composition.",
+        "Preserve the exact overall silhouette, major proportions, color blocking, material, distinctive details, logo placement, handle/cap/nozzle/label placement and packaging geometry from the reference.",
+        "If the camera angle changes, reinterpret the same object in perspective instead of redesigning it. Do not invent new parts, remove key parts, change brand marks, change product geometry, mirror the label incorrectly, or merge it with nearby objects.",
+        "If the scene request conflicts with anchor consistency, simplify the pose/camera/composition so the anchor remains recognizable and structurally faithful.",
+        "Use attached images only as visual reference; never draw reference sheets, labels, UI frames, watermarks, or white-background catalog layout unless explicitly requested."
       ]
         .filter(Boolean)
         .join(". ");
     })
     .join("\n");
+}
+
+function normalizeMatchText(value: string) {
+  return value.toLowerCase().replace(/\s+/g, "");
+}
+
+function anchorMatchTerms(anchor: VisualAnchor) {
+  const rawTerms = [
+    anchor.name,
+    anchorTypeLabel[anchor.type],
+    ...anchor.name.split(/[\s,，、/｜|:：;；()（）[\]【】"'“”‘’]+/),
+    ...anchor.description.split(/[\s,，、.。/｜|:：;；()（）[\]【】"'“”‘’]+/),
+    ...anchor.usagePrompt.split(/[\s,，、.。/｜|:：;；()（）[\]【】"'“”‘’]+/),
+    ...getAnchorReferenceImages(anchor).flatMap((image) => [
+      image.label,
+      ...image.label.split(/[\s,，、.。/｜|:：;；()（）[\]【】"'“”‘’]+/)
+    ])
+  ];
+  return Array.from(
+    new Set(
+      rawTerms
+        .map((term) => term.trim())
+        .filter((term) => term.length >= 2)
+    )
+  );
+}
+
+function suggestAnchorIdsForPage(project: ComicProject, page: ComicPage) {
+  const haystack = normalizeMatchText([page.title, page.beat, page.shot, page.character, page.background, page.prompt].filter(Boolean).join("\n"));
+  if (!haystack) return [];
+  return getEnabledAnchors(project)
+    .map((anchor) => {
+      let score = 0;
+      const name = normalizeMatchText(anchor.name);
+      if (name && haystack.includes(name)) score += 6;
+      for (const term of anchorMatchTerms(anchor)) {
+        const normalizedTerm = normalizeMatchText(term);
+        if (!normalizedTerm || normalizedTerm === name) continue;
+        if (haystack.includes(normalizedTerm)) score += normalizedTerm.length >= 4 ? 2 : 1;
+      }
+      return { anchor, score };
+    })
+    .filter((item) => item.score >= 3)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 4)
+    .map((item) => item.anchor.id);
+}
+
+function applyAutoAnchorBindings(project: ComicProject, pages: ComicPage[]) {
+  return pages.map((page) => (
+    page.anchorBindingMode === "manual"
+      ? page
+      : { ...page, anchorIds: suggestAnchorIdsForPage(project, page), anchorBindingMode: "auto" as const }
+  ));
+}
+
+function renderAnchorPrompt(template: string, anchorsText: string) {
+  const hasAnchorToken = /\{\{\s*anchors\s*\}\}/.test(template);
+  const rendered = renderPromptTemplate(template, { anchors: anchorsText || "No fixed visual anchor is selected for this page." });
+  return hasAnchorToken || !anchorsText ? rendered : `Visual anchors, must be followed before scene details:\n${anchorsText}\n\n${rendered}`;
 }
 
 function createPagePrompt(templates: PromptTemplates, characters: CharacterTemplate[], beat: string, shot: string, background: string) {
@@ -299,7 +382,7 @@ function normalizeProject(project: ComicProject): ComicProject {
   return {
     ...defaultProject,
     ...project,
-    pages: (project.pages ?? []).map((page) => ({ ...page, anchorIds: page.anchorIds ?? [] })),
+    pages: (project.pages ?? []).map((page) => ({ ...page, anchorIds: page.anchorIds ?? [], anchorBindingMode: page.anchorBindingMode ?? "auto" })),
     castCharacterIds: project.castCharacterIds ?? [],
     deletedCharacterIds: project.deletedCharacterIds ?? [],
     customCharacters: project.customCharacters ?? [],
@@ -509,7 +592,7 @@ function AnchorMultiSelect({
     <div className={compact ? "grid grid-cols-2 gap-2" : "grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-2"}>
       {anchors.map((anchor) => {
         const active = selectedIds.includes(anchor.id);
-        const preview = anchor.primaryImageUrl ?? anchor.images[0]?.url;
+        const preview = getAnchorPreviewUrl(anchor);
         return (
           <button
             type="button"
@@ -543,10 +626,14 @@ function Shell({
   doneCount,
   provider,
   isBusy,
+  isGenerating,
+  isQueuePaused,
   isDark,
   setIsDark,
   onPlan,
   onGenerate,
+  onToggleQueuePause,
+  onCancelQueuedPages,
   onSave,
   latestLog,
   openLogs,
@@ -559,10 +646,14 @@ function Shell({
   doneCount: number;
   provider: ApiProvider;
   isBusy: boolean;
+  isGenerating: boolean;
+  isQueuePaused: boolean;
   isDark: boolean;
   setIsDark: (value: boolean) => void;
   onPlan: () => void;
   onGenerate: (mock: boolean) => void;
+  onToggleQueuePause: () => void;
+  onCancelQueuedPages: () => void;
   onSave: () => void;
   latestLog?: AppLogEntry;
   openLogs: () => void;
@@ -641,6 +732,18 @@ function Shell({
               {isBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wand2 className="h-4 w-4" />}
               生成大纲
             </Button>
+            {isGenerating ? (
+              <>
+                <Button variant="outline" onClick={onToggleQueuePause}>
+                  {isQueuePaused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}
+                  {isQueuePaused ? "继续队列" : "暂停队列"}
+                </Button>
+                <Button variant="outline" onClick={onCancelQueuedPages}>
+                  <X className="h-4 w-4" />
+                  取消排队
+                </Button>
+              </>
+            ) : null}
             <Button variant="secondary" disabled={isBusy || !project.pages.length} onClick={() => onGenerate(true)}>
               <Sparkles className="h-4 w-4" />
               Mock 出图
@@ -1012,6 +1115,7 @@ function StoryboardView({
   setProject,
   regeneratePage,
   createNewPage,
+  cancelQueuedPage,
   inspectorOpen,
   setInspectorOpen,
   canUseApi,
@@ -1021,6 +1125,7 @@ function StoryboardView({
   setProject: React.Dispatch<React.SetStateAction<ComicProject>>;
   regeneratePage: (pageId: string, mock: boolean) => void;
   createNewPage: () => void;
+  cancelQueuedPage: (pageId: string) => void;
   inspectorOpen: boolean;
   setInspectorOpen: (open: boolean) => void;
   canUseApi: boolean;
@@ -1077,7 +1182,7 @@ function StoryboardView({
           {project.pages.map((page, index) => (
             <motion.article
               key={page.id}
-              className={`group overflow-hidden rounded-lg border bg-white shadow-sm transition ${
+              className={`group flex h-full flex-col overflow-hidden rounded-lg border bg-white shadow-sm transition ${
                 project.selectedPageId === page.id ? "border-teal-500 ring-2 ring-teal-500/20" : "hover:border-teal-400"
               }`}
               onClick={() => setProject((prev) => ({ ...prev, selectedPageId: page.id }))}
@@ -1109,7 +1214,7 @@ function StoryboardView({
                   <PageStatusPill status={page.status} />
                 </div>
               </button>
-              <div className="space-y-3 p-3">
+              <div className="flex flex-1 flex-col space-y-3 p-3">
                 <button
                   type="button"
                   title={`编辑第 ${page.pageNumber} 页`}
@@ -1122,7 +1227,7 @@ function StoryboardView({
                   <div className="truncate text-sm font-semibold">{page.title}</div>
                   <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{page.beat}</p>
                 </button>
-                <div className="flex flex-wrap gap-1">
+                <div className="flex min-h-[50px] max-h-[50px] flex-wrap content-start gap-1 overflow-hidden">
                   {getPageCharacters(project, page).map((character) => (
                     <Badge key={character.id} className="max-w-full border-teal-100 bg-teal-50 text-[11px] text-teal-800">
                       <span className="truncate">{character.name}</span>
@@ -1134,52 +1239,68 @@ function StoryboardView({
                     </Badge>
                   ))}
                 </div>
-                <Progress value={page.progress} />
-                <div className="grid grid-cols-5 gap-1">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    aria-label={`编辑第 ${page.pageNumber} 页`}
-                    onClick={(event) => { event.stopPropagation(); editPage(page.id); }}
-                  >
-                    <PanelRight className="h-3.5 w-3.5" />
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={index === 0}
-                    aria-label={`将第 ${page.pageNumber} 页前移`}
-                    onClick={(event) => { event.stopPropagation(); movePage(page.id, -1); }}
-                  >
-                    <ChevronLeft className="h-3.5 w-3.5" />
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={index === project.pages.length - 1}
-                    aria-label={`将第 ${page.pageNumber} 页后移`}
-                    onClick={(event) => { event.stopPropagation(); movePage(page.id, 1); }}
-                  >
-                    <ChevronRight className="h-3.5 w-3.5" />
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={!canUseApi}
-                    aria-label={`用 API 重新生成第 ${page.pageNumber} 页`}
-                    onClick={(event) => { event.stopPropagation(); regeneratePage(page.id, false); }}
-                  >
-                    <RefreshCw className="h-3.5 w-3.5" />
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="destructive"
-                    aria-label={`删除第 ${page.pageNumber} 页`}
-                    onClick={(event) => { event.stopPropagation(); deletePage(page.id); }}
-                  >
-                    ×
-                  </Button>
+                <div className="mt-auto space-y-3">
+                  <Progress value={page.progress} />
+                  <div className="grid grid-cols-5 gap-1">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      aria-label={`编辑第 ${page.pageNumber} 页`}
+                      onClick={(event) => { event.stopPropagation(); editPage(page.id); }}
+                    >
+                      <PanelRight className="h-3.5 w-3.5" />
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={index === 0}
+                      aria-label={`将第 ${page.pageNumber} 页前移`}
+                      onClick={(event) => { event.stopPropagation(); movePage(page.id, -1); }}
+                    >
+                      <ChevronLeft className="h-3.5 w-3.5" />
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={index === project.pages.length - 1}
+                      aria-label={`将第 ${page.pageNumber} 页后移`}
+                      onClick={(event) => { event.stopPropagation(); movePage(page.id, 1); }}
+                    >
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={!canUseApi}
+                      aria-label={`用 API 重新生成第 ${page.pageNumber} 页`}
+                      onClick={(event) => { event.stopPropagation(); regeneratePage(page.id, false); }}
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="destructive"
+                      aria-label={`删除第 ${page.pageNumber} 页`}
+                      onClick={(event) => { event.stopPropagation(); deletePage(page.id); }}
+                    >
+                      ×
+                    </Button>
+                  </div>
                 </div>
+                {page.status === "queued" ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="w-full"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      cancelQueuedPage(page.id);
+                    }}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                    取消排队
+                  </Button>
+                ) : null}
               </div>
             </motion.article>
           ))}
@@ -1755,17 +1876,30 @@ function CharactersView({
 
 function AnchorsView({
   project,
+  projects,
   setProject,
   onToast
 }: {
   project: ComicProject;
+  projects: ProjectRecord[];
   setProject: React.Dispatch<React.SetStateAction<ComicProject>>;
   onToast: (title: string, description: string) => void;
 }) {
   const [previewImage, setPreviewImage] = useState<{ url: string; title: string } | undefined>();
   const anchors = project.visualAnchors ?? [];
   const selectedAnchor = anchors.find((item) => item.id === project.selectedAnchorId) ?? anchors[0];
-  const mainImageUrl = selectedAnchor?.primaryImageUrl ?? selectedAnchor?.images[0]?.url;
+  const selectedAnchorReferenceImages = selectedAnchor ? getAnchorReferenceImages(selectedAnchor) : [];
+  const selectedAnchorPrimaryUrl = selectedAnchor ? getAnchorPrimaryReferenceUrl(selectedAnchor) : undefined;
+  const mainImageUrl = selectedAnchor ? getAnchorPreviewUrl(selectedAnchor) : undefined;
+  const importableAnchors = projects
+    .filter((record) => record.meta.id !== project.id)
+    .flatMap((record) =>
+      (record.project.visualAnchors ?? []).map((anchor) => ({
+        projectId: record.meta.id,
+        projectName: record.meta.name,
+        anchor
+      }))
+    );
 
   function patchAnchor(anchorId: string, patch: Partial<VisualAnchor>) {
     setProject((prev) => ({
@@ -1798,6 +1932,41 @@ function AnchorsView({
     }));
   }
 
+  function uniqueAnchorName(baseName: string) {
+    const names = new Set(anchors.map((anchor) => anchor.name));
+    if (!names.has(baseName)) return baseName;
+    let index = 2;
+    let candidate = `${baseName}（导入）`;
+    while (names.has(candidate)) {
+      candidate = `${baseName}（导入${index}）`;
+      index += 1;
+    }
+    return candidate;
+  }
+
+  function importAnchorFromProject(sourceAnchor: VisualAnchor, sourceProjectName: string) {
+    const createdAt = new Date().toISOString();
+    const imported: VisualAnchor = {
+      ...sourceAnchor,
+      id: nowId("anchor"),
+      name: uniqueAnchorName(sourceAnchor.name),
+      images: (sourceAnchor.images ?? []).map((image) => ({
+        ...image,
+        id: nowId("anchor_image"),
+        createdAt
+      })),
+      createdAt,
+      updatedAt: createdAt
+    };
+    setProject((prev) => ({
+      ...prev,
+      selectedAnchorId: imported.id,
+      visualAnchors: [...(prev.visualAnchors ?? []), imported],
+      updatedAt: createdAt
+    }));
+    onToast("已导入素材", `已从「${sourceProjectName}」导入「${sourceAnchor.name}」。`);
+  }
+
   function deleteAnchor(anchorId: string) {
     setProject((prev) => {
       const visualAnchors = (prev.visualAnchors ?? []).filter((anchor) => anchor.id !== anchorId);
@@ -1823,13 +1992,15 @@ function AnchorsView({
           id: nowId("anchor_image"),
           label: file.name.replace(/\.[^.]+$/, "") || `锚点图 ${index + 1}`,
           url: url ?? rawUrl,
+          useAsReference: true,
           createdAt
         };
       })
     );
+    const nextImages = [...targetAnchor.images, ...images];
     patchAnchor(anchorId, {
-      images: [...targetAnchor.images, ...images],
-      primaryImageUrl: targetAnchor.primaryImageUrl ?? images[0]?.url
+      images: nextImages,
+      primaryImageUrl: pickAnchorPrimaryImageUrl(nextImages, targetAnchor.primaryImageUrl ?? images[0]?.url)
     });
   }
 
@@ -1837,17 +2008,32 @@ function AnchorsView({
     const targetAnchor = anchors.find((anchor) => anchor.id === anchorId);
     const image = targetAnchor?.images.find((item) => item.id === imageId);
     if (!targetAnchor || !image) return;
-    patchAnchor(anchorId, { primaryImageUrl: image.url });
-    onToast("已设置主参考", `后续绑定「${targetAnchor.name}」的页面会优先使用「${image.label}」。`);
+    patchAnchor(anchorId, {
+      images: targetAnchor.images.map((item) => (
+        item.id === imageId ? { ...item, useAsReference: true } : item
+      )),
+      primaryImageUrl: image.url
+    });
+    onToast("已设置主要参考", `「${image.label}」会作为「${targetAnchor.name}」的第一张参考图。`);
+  }
+
+  function setAnchorImageReference(anchorId: string, imageId: string, useAsReference: boolean) {
+    const targetAnchor = anchors.find((anchor) => anchor.id === anchorId);
+    if (!targetAnchor) return;
+    const images = targetAnchor.images.map((image) => (
+      image.id === imageId ? { ...image, useAsReference } : image
+    ));
+    patchAnchor(anchorId, {
+      images,
+      primaryImageUrl: pickAnchorPrimaryImageUrl(images, targetAnchor.primaryImageUrl)
+    });
   }
 
   function removeAnchorImage(anchorId: string, imageId: string) {
     const targetAnchor = anchors.find((anchor) => anchor.id === anchorId);
     if (!targetAnchor) return;
-    const removedImage = targetAnchor.images.find((image) => image.id === imageId);
     const images = targetAnchor.images.filter((image) => image.id !== imageId);
-    const primaryImageUrl = removedImage?.url === targetAnchor.primaryImageUrl ? images[0]?.url : targetAnchor.primaryImageUrl;
-    patchAnchor(anchorId, { images, primaryImageUrl });
+    patchAnchor(anchorId, { images, primaryImageUrl: pickAnchorPrimaryImageUrl(images, targetAnchor.primaryImageUrl) });
   }
 
   return (
@@ -1863,10 +2049,46 @@ function AnchorsView({
             新建
           </Button>
         </div>
+
+        {importableAnchors.length ? (
+          <div className="mb-3 rounded-md border border-[#ded8cc] bg-[#fbfaf6] p-3">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="truncate text-xs font-semibold">从其他项目导入</div>
+                <p className="mt-0.5 truncate text-[11px] text-muted-foreground">复制素材锚点和参考图，不会自动同步。</p>
+              </div>
+              <Badge className="border border-zinc-200 bg-white text-[10px] text-zinc-700">{importableAnchors.length}</Badge>
+            </div>
+            <div className="max-h-36 space-y-1 overflow-auto pr-1 scrollbar-thin">
+              {importableAnchors.map(({ projectId, projectName, anchor }) => {
+                const preview = getAnchorPreviewUrl(anchor);
+                return (
+                  <button
+                    type="button"
+                    key={`${projectId}:${anchor.id}`}
+                    title={`从项目「${projectName}」导入素材：${anchor.name}`}
+                    className="flex w-full min-w-0 items-center gap-2 rounded-md border border-transparent px-2 py-1.5 text-left transition hover:border-[#ded8cc] hover:bg-white"
+                    onClick={() => importAnchorFromProject(anchor, projectName)}
+                  >
+                    <span className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded border bg-white">
+                      {preview ? <img src={preview} alt={anchor.name} className="h-full w-full object-contain" /> : <Layers3 className="h-4 w-4 text-teal-600" />}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-xs font-medium">{anchor.name}</span>
+                      <span className="block truncate text-[11px] text-muted-foreground">{projectName} · {anchorTypeLabel[anchor.type]}</span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
+
         <div className="min-h-0 flex-1 space-y-2 overflow-auto pr-1 scrollbar-thin">
           {anchors.map((anchor) => {
             const active = selectedAnchor?.id === anchor.id;
-            const preview = anchor.primaryImageUrl ?? anchor.images[0]?.url;
+            const preview = getAnchorPreviewUrl(anchor);
+            const referenceCount = getAnchorReferenceImages(anchor).length;
             return (
               <button
                 type="button"
@@ -1886,7 +2108,7 @@ function AnchorsView({
                     <Badge className="shrink-0 border-zinc-200 bg-white text-[10px] text-zinc-700">{anchorTypeLabel[anchor.type]}</Badge>
                   </div>
                   <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{anchor.description}</p>
-                  <div className="mt-1 text-[11px] text-zinc-500">{anchor.images.length} 张参考图</div>
+                  <div className="mt-1 text-[11px] text-zinc-500">{referenceCount}/{anchor.images.length} 张参与参考</div>
                 </div>
               </button>
             );
@@ -1906,9 +2128,9 @@ function AnchorsView({
               <div className="mb-4 flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <h2 className="truncate text-lg font-semibold">{selectedAnchor.name}</h2>
-                  <p className="mt-1 text-sm text-muted-foreground">绑定到分镜页后，参考图会随该页一起传给图片模型。</p>
+                  <p className="mt-1 text-sm text-muted-foreground">勾选多张参与参考，并指定一张主要参考；只有已勾选图片会传给图片模型。</p>
                 </div>
-                <Badge className="border border-zinc-200 bg-transparent text-zinc-700">{selectedAnchor.images.length} 张参考图</Badge>
+                <Badge className="border border-zinc-200 bg-transparent text-zinc-700">{selectedAnchorReferenceImages.length}/{selectedAnchor.images.length} 张参与</Badge>
               </div>
               <div className="overflow-hidden rounded-lg border bg-[#f7f3ea]">
                 {mainImageUrl ? (
@@ -1931,10 +2153,11 @@ function AnchorsView({
                 <Button variant="outline" asChild className="w-full">
                   <label className="cursor-pointer" title="上传素材参考图">
                     <ImagePlus className="h-4 w-4" />
-                    上传参考图
+                    上传多张参考图
                     <input className="hidden" type="file" accept="image/*" multiple onChange={(event) => uploadAnchorImages(selectedAnchor.id, event.target.files)} />
                   </label>
                 </Button>
+                <p className="mt-2 text-xs text-muted-foreground">生成时每个素材最多携带 {MAX_ANCHOR_REFERENCE_IMAGES_PER_ANCHOR} 张已勾选图片，主要参考排在第一张。</p>
               </div>
             </div>
 
@@ -1984,14 +2207,15 @@ function AnchorsView({
               <div>
                 <div className="mb-2 flex items-center justify-between">
                   <Label>参考图列表</Label>
-                  <span className="text-xs text-muted-foreground">白图、实拍图、包装图都可以放这里</span>
+                  <span className="text-xs text-muted-foreground">选择要带入生成的图，再指定一张主要参考</span>
                 </div>
                 {selectedAnchor.images.length ? (
                   <div className="grid grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-3">
                     {selectedAnchor.images.map((image) => {
-                      const isPrimary = image.url === selectedAnchor.primaryImageUrl;
+                      const useAsReference = image.useAsReference !== false;
+                      const isPrimary = useAsReference && image.url === selectedAnchorPrimaryUrl;
                       return (
-                        <div key={image.id} className="overflow-hidden rounded-md border bg-white">
+                        <div key={image.id} className={`overflow-hidden rounded-md border bg-white ${useAsReference ? "" : "opacity-75"}`}>
                           <button
                             type="button"
                             title={`放大查看参考图：${image.label}`}
@@ -1999,21 +2223,32 @@ function AnchorsView({
                             onClick={() => setPreviewImage({ url: image.url, title: image.label })}
                           >
                             <img src={image.url} alt={image.label} className="h-full w-full object-contain" />
-                            {isPrimary ? <Badge className="absolute left-2 top-2 border-emerald-200 bg-emerald-50 text-[10px] text-emerald-700">主参考</Badge> : null}
+                            {isPrimary ? <Badge className="absolute left-2 top-2 border-emerald-200 bg-emerald-50 text-[10px] text-emerald-700">主要参考</Badge> : null}
+                            {!useAsReference ? <Badge className="absolute left-2 top-2 border-zinc-200 bg-white text-[10px] text-zinc-600">未参与</Badge> : null}
                           </button>
-                          <div className="flex items-center justify-between gap-2 p-2">
+                          <div className="space-y-2 p-2">
                             <span className="min-w-0 truncate text-xs font-medium">{image.label}</span>
-                            <div className="flex shrink-0 items-center gap-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[11px] text-muted-foreground">参与参考</span>
+                              <Switch
+                                checked={useAsReference}
+                                onCheckedChange={(checked) => setAnchorImageReference(selectedAnchor.id, image.id, checked)}
+                                aria-label={`是否参与参考：${image.label}`}
+                              />
+                            </div>
+                            <div className="flex items-center justify-between gap-1">
                               <Button
                                 size="sm"
                                 variant="ghost"
-                                aria-label={`设为主参考：${image.label}`}
+                                className="h-7 flex-1 px-2 text-[11px]"
+                                aria-label={`设为主要参考：${image.label}`}
                                 disabled={isPrimary}
                                 onClick={() => setPrimaryAnchorImage(selectedAnchor.id, image.id)}
                               >
                                 <Check className="h-3.5 w-3.5" />
+                                主要
                               </Button>
-                              <Button size="sm" variant="ghost" aria-label={`删除参考图：${image.label}`} onClick={() => removeAnchorImage(selectedAnchor.id, image.id)}>
+                              <Button size="sm" variant="ghost" className="h-7 px-2" aria-label={`删除参考图：${image.label}`} onClick={() => removeAnchorImage(selectedAnchor.id, image.id)}>
                                 <X className="h-3.5 w-3.5" />
                               </Button>
                             </div>
@@ -2929,6 +3164,7 @@ function Inspector({
   const enabledAnchors = getEnabledAnchors(project);
   const selectedPageCharacters = selectedPage ? getPageCharacters(project, selectedPage) : [];
   const selectedPageAnchors = selectedPage ? getPageAnchors(project, selectedPage) : [];
+  const selectedPageAnchorMode = selectedPage?.anchorBindingMode ?? "auto";
 
   function updateSelectedPage(patch: Partial<ComicPage>) {
     if (!selectedPage) return;
@@ -2936,7 +3172,16 @@ function Inspector({
       ...prev,
       updatedAt: new Date().toISOString(),
       longImageUrl: undefined,
-      pages: prev.pages.map((page) => (page.id === selectedPage.id ? { ...page, ...patch } : page))
+      pages: prev.pages.map((page) => {
+        if (page.id !== selectedPage.id) return page;
+        const nextPage = { ...page, ...patch };
+        const shouldAutoMatch =
+          nextPage.anchorBindingMode !== "manual" &&
+          ["title", "beat", "shot", "character", "background", "prompt"].some((key) => key in patch);
+        return shouldAutoMatch
+          ? { ...nextPage, anchorIds: suggestAnchorIdsForPage(prev, nextPage), anchorBindingMode: "auto" }
+          : nextPage;
+      })
     }));
   }
 
@@ -3039,16 +3284,34 @@ function Inspector({
               </div>
             </div>
             <div>
-              <Label>本页素材锚点</Label>
+              <div className="flex items-center justify-between gap-2">
+                <Label>本页素材锚点</Label>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={!selectedPage}
+                  onClick={() => {
+                    if (!selectedPage) return;
+                    updateSelectedPage({
+                      anchorIds: suggestAnchorIdsForPage(project, selectedPage),
+                      anchorBindingMode: "auto"
+                    });
+                  }}
+                >
+                  自动匹配
+                </Button>
+              </div>
               <div className="mt-2">
                 <AnchorMultiSelect
                   anchors={enabledAnchors}
                   selectedIds={selectedPage.anchorIds ?? selectedPageAnchors.map((anchor) => anchor.id)}
-                  onChange={(ids) => updateSelectedPage({ anchorIds: ids })}
+                  onChange={(ids) => updateSelectedPage({ anchorIds: ids, anchorBindingMode: "manual" })}
                   compact
                 />
               </div>
-              <p className="mt-1 text-xs text-muted-foreground">绑定后，参考图模式会把这些素材图和人设图一起传给图片模型。</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {selectedPageAnchorMode === "manual" ? "当前页使用手动选择；点击自动匹配可重新按剧情识别。" : "当前页会按剧情、画面、背景和提示词自动匹配素材。"}
+              </p>
             </div>
             <div className="grid grid-cols-1 gap-3">
               <div>
@@ -3134,6 +3397,7 @@ export function App() {
   const [templates, setTemplates] = useState<PromptTemplates>(initial.templates);
   const [workflow, setWorkflow] = useState<WorkflowNodeConfig[]>(initial.workflow);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isQueuePaused, setIsQueuePaused] = useState(false);
   const [isPlanning, setIsPlanning] = useState(false);
   const [isDark, setIsDark] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
@@ -3145,6 +3409,8 @@ export function App() {
   const activeProjectIdRef = useRef(activeProjectId);
   const keySaveBaselineRef = useRef<string>();
   const providersRef = useRef(providers);
+  const queuePausedRef = useRef(false);
+  const cancelledQueuedPageIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", isDark);
@@ -3416,7 +3682,10 @@ export function App() {
       updateProjectState((prev) => ({
         ...prev,
         outline: result.outline,
-        pages: result.pages.map((page) => ({ ...page, anchorIds: page.anchorIds ?? [], prompt: withStyleLock(page.prompt, prev) })),
+        pages: applyAutoAnchorBindings(
+          prev,
+          result.pages.map((page) => ({ ...page, anchorIds: page.anchorIds ?? [], anchorBindingMode: "auto" as const, prompt: withStyleLock(page.prompt, prev) }))
+        ),
         selectedPageId: result.pages[0]?.id,
         longImageUrl: undefined,
         updatedAt: new Date().toISOString()
@@ -3430,7 +3699,10 @@ export function App() {
       updateProjectState((prev) => ({
         ...prev,
         outline: result.outline,
-        pages: result.pages.map((page) => ({ ...page, anchorIds: page.anchorIds ?? [], prompt: withStyleLock(page.prompt, prev) })),
+        pages: applyAutoAnchorBindings(
+          prev,
+          result.pages.map((page) => ({ ...page, anchorIds: page.anchorIds ?? [], anchorBindingMode: "auto" as const, prompt: withStyleLock(page.prompt, prev) }))
+        ),
         selectedPageId: result.pages[0]?.id,
         longImageUrl: undefined,
         updatedAt: new Date().toISOString()
@@ -3451,6 +3723,52 @@ export function App() {
       longImageUrl: undefined,
       pages: prev.pages.map((page) => (page.id === pageId ? { ...page, ...patch } : page))
     }));
+  }
+
+  function setQueuePaused(paused: boolean) {
+    queuePausedRef.current = paused;
+    setIsQueuePaused(paused);
+  }
+
+  function toggleQueuePause() {
+    if (!isGenerating) return;
+    const nextPaused = !queuePausedRef.current;
+    setQueuePaused(nextPaused);
+    addLog({
+      level: "info",
+      module: "image",
+      action: nextPaused ? "queue-paused" : "queue-resumed",
+      message: nextPaused ? "生成队列已暂停" : "生成队列已继续",
+      projectId: project.id
+    });
+  }
+
+  function cancelQueuedPage(pageId: string) {
+    cancelledQueuedPageIdsRef.current.add(pageId);
+    patchPage(pageId, { status: "draft", progress: 0, error: undefined });
+    addLog({ level: "info", module: "image", action: "queue-cancel-page", message: "已取消排队页面", projectId: project.id, pageId });
+  }
+
+  function cancelQueuedPages() {
+    const queuedPages = project.pages.filter((page) => page.status === "queued");
+    setQueuePaused(false);
+    for (const page of queuedPages) {
+      cancelledQueuedPageIdsRef.current.add(page.id);
+    }
+    updateProjectState((prev) => ({
+      ...prev,
+      pages: prev.pages.map((page) => (
+        page.status === "queued" ? { ...page, status: "draft", progress: 0, error: undefined } : page
+      )),
+      updatedAt: new Date().toISOString()
+    }));
+    addLog({ level: "info", module: "image", action: "queue-cancel", message: `已取消 ${queuedPages.length} 个排队任务`, projectId: project.id });
+  }
+
+  async function waitIfQueuePaused() {
+    while (queuePausedRef.current) {
+      await sleep(250);
+    }
   }
 
   function createImageVersion(page: ComicPage, imageUrl: string): PageImageVersion {
@@ -3474,7 +3792,8 @@ export function App() {
   }
 
   function getPageAnchorsForGeneration(page: ComicPage) {
-    return getPageAnchors(project, page);
+    const anchorIds = page.anchorBindingMode === "manual" ? page.anchorIds ?? [] : suggestAnchorIdsForPage(project, page);
+    return getPageAnchors(project, { ...page, anchorIds });
   }
 
   function isAcceptedButUnfinishedImageError(error: unknown) {
@@ -3483,13 +3802,34 @@ export function App() {
   }
 
   async function generateOne(page: ComicPage, mock: boolean) {
-    const pageAnchors = getPageAnchorsForGeneration(page);
+    const autoAnchorIds = page.anchorBindingMode === "manual" ? page.anchorIds ?? [] : suggestAnchorIdsForPage(project, page);
+    const pageWithAnchors = page.anchorBindingMode === "manual" ? page : { ...page, anchorIds: autoAnchorIds, anchorBindingMode: "auto" as const };
+    if (page.anchorBindingMode !== "manual" && JSON.stringify(page.anchorIds ?? []) !== JSON.stringify(autoAnchorIds)) {
+      patchPage(page.id, { anchorIds: autoAnchorIds, anchorBindingMode: "auto" });
+    }
+    const pageAnchors = getPageAnchorsForGeneration(pageWithAnchors);
     const anchorPrompt = buildAnchorPrompt(pageAnchors);
     const pageForGeneration = {
-      ...page,
-      prompt: withStyleLock(anchorPrompt ? `${page.prompt}\n\nVisual anchors:\n${anchorPrompt}` : page.prompt, project)
+      ...pageWithAnchors,
+      prompt: withStyleLock(renderAnchorPrompt(pageWithAnchors.prompt, anchorPrompt), project)
     };
-    addLog({ level: "info", module: "image", action: mock ? "mock-start" : "api-start", message: `开始生成第 ${page.pageNumber} 页`, projectId: project.id, pageId: page.id, detail: mock ? "mock" : imageModel.model });
+    const effectiveImageEndpoint = imageModel.endpointMode === "chat-text" ? imageProvider.endpointMode : imageModel.endpointMode;
+    const referenceMode = effectiveImageEndpoint === "image-edits" || effectiveImageEndpoint === "chat-image";
+    addLog({
+      level: "info",
+      module: "image",
+      action: mock ? "mock-start" : "api-start",
+      message: `开始生成第 ${page.pageNumber} 页`,
+      projectId: project.id,
+      pageId: page.id,
+      detail: mock
+        ? "mock"
+        : [
+            imageModel.model,
+            pageAnchors.length ? `素材锚点：${pageAnchors.map((anchor) => anchor.name).join("、")}` : "素材锚点：无",
+            referenceMode ? "当前端点支持传参考图" : "当前端点不支持传参考图，仅使用素材文字"
+          ].join("\n")
+    });
     patchPage(page.id, { status: "generating", progress: 12, error: undefined, ...(mock ? {} : { imageUrl: undefined }) });
     for (const progress of [28, 44, 63, 78]) {
       await sleep(mock ? 180 + Math.random() * 180 : 80);
@@ -3583,6 +3923,8 @@ export function App() {
   async function handleGenerate(mock: boolean) {
     if (!project.pages.length) return;
     setIsGenerating(true);
+    setQueuePaused(false);
+    cancelledQueuedPageIdsRef.current = new Set();
     const pendingPages = project.pages.filter((page) => page.status !== "done");
     updateProjectState((prev) => ({
       ...prev,
@@ -3591,25 +3933,41 @@ export function App() {
     addLog({ level: "info", module: "image", action: "queue", message: `已加入 ${pendingPages.length} 个生成任务`, projectId: project.id, detail: mock ? "mock" : imageModel.model });
     try {
       let failedCount = 0;
-      await runWithConcurrency(pendingPages, project.concurrency, async (page) => {
-        try {
-          const success = await generateOne(page, mock);
-          if (!success) failedCount += 1;
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "生成任务异常中断";
-          patchPage(page.id, { status: "failed", progress: 100, error: message });
-          failedCount += 1;
+      let cancelledCount = 0;
+      let cursor = 0;
+      const concurrency = Math.max(1, Math.min(10, project.concurrency || 1));
+      const workers = Array.from({ length: Math.min(concurrency, pendingPages.length) }).map(async () => {
+        while (cursor < pendingPages.length) {
+          await waitIfQueuePaused();
+          const page = pendingPages[cursor];
+          cursor += 1;
+          if (!page) return;
+          if (cancelledQueuedPageIdsRef.current.has(page.id)) {
+            cancelledCount += 1;
+            continue;
+          }
+          try {
+            const success = await generateOne(page, mock);
+            if (!success) failedCount += 1;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "生成任务异常中断";
+            patchPage(page.id, { status: "failed", progress: 100, error: message });
+            failedCount += 1;
+          }
+          await sleep(20);
         }
       });
+      await Promise.all(workers);
       showToast(
         failedCount ? (mock ? "Mock 部分失败" : "API 部分失败") : (mock ? "Mock 生成完成" : "API 生成完成"),
-        failedCount ? `${failedCount} 页失败，可以在分镜页查看错误并单独重试。` : "失败页面可以单独重试。"
+        failedCount ? `${failedCount} 页失败，${cancelledCount} 页已取消。` : `${cancelledCount} 页已取消，失败页面可以单独重试。`
       );
       addLog({
         level: failedCount ? "warn" : "success",
         module: "image",
         action: "batch-done",
         message: failedCount ? `${failedCount} 页生成失败` : (mock ? "Mock 生成完成" : "API 并发生成完成"),
+        detail: cancelledCount ? `已取消排队任务：${cancelledCount}` : undefined,
         projectId: project.id
       });
     } catch (error) {
@@ -3620,6 +3978,7 @@ export function App() {
       showToast("生成队列异常", message);
       addLog({ level: "error", module: "image", action: "batch-failed", message: "生成队列异常", projectId: project.id, detail: message });
     } finally {
+      setQueuePaused(false);
       setIsGenerating(false);
     }
   }
@@ -3653,6 +4012,7 @@ export function App() {
       character: getCharacterNames(pageCharacters),
       characterIds: pageCharacters.map((character) => character.id),
       anchorIds: [],
+      anchorBindingMode: "auto",
       background,
       ratio: project.exportRatio,
       prompt: withStyleLock(createPagePrompt(templates, pageCharacters, beat, shot, background), project),
@@ -3663,7 +4023,10 @@ export function App() {
       seed: Math.floor(Math.random() * 100000),
       versions: []
     };
-    updateProjectState((prev) => ({ ...prev, pages: [...prev.pages, page], selectedPageId: page.id, updatedAt: new Date().toISOString() }));
+    updateProjectState((prev) => {
+      const pageWithAnchors = { ...page, anchorIds: suggestAnchorIdsForPage(prev, page), anchorBindingMode: "auto" as const };
+      return { ...prev, pages: [...prev.pages, pageWithAnchors], selectedPageId: page.id, updatedAt: new Date().toISOString() };
+    });
     addLog({ level: "info", module: "project", action: "add-page", message: `已新增第 ${pageNumber} 页`, projectId: project.id, pageId: page.id });
   }
 
@@ -3691,6 +4054,7 @@ export function App() {
         setProject={setCurrentProject}
         regeneratePage={regeneratePage}
         createNewPage={createNewPage}
+        cancelQueuedPage={cancelQueuedPage}
         inspectorOpen={inspectorOpen}
         setInspectorOpen={setInspectorOpen}
         canUseApi={Boolean(imageProvider.apiKey)}
@@ -3700,7 +4064,7 @@ export function App() {
   } else if (activeTab === "characters") {
     content = <CharactersView project={project} projects={projects} setProject={setCurrentProject} imageProvider={imageProvider} imageModel={imageModel} onToast={showToast} addLog={addLog} />;
   } else if (activeTab === "anchors") {
-    content = <AnchorsView project={project} setProject={setCurrentProject} onToast={showToast} />;
+    content = <AnchorsView project={project} projects={projects} setProject={setCurrentProject} onToast={showToast} />;
   } else if (activeTab === "projects") {
     content = (
       <ProjectsView
@@ -3745,10 +4109,14 @@ export function App() {
           doneCount={doneCount}
           provider={imageProvider}
           isBusy={isPlanning || isGenerating}
+          isGenerating={isGenerating}
+          isQueuePaused={isQueuePaused}
           isDark={isDark}
           setIsDark={setIsDark}
           onPlan={handlePlan}
           onGenerate={handleGenerate}
+          onToggleQueuePause={toggleQueuePause}
+          onCancelQueuedPages={cancelQueuedPages}
           onSave={handleSave}
           latestLog={logs[0]}
           openLogs={() => setActiveTab("logs")}
